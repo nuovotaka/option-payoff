@@ -381,18 +381,16 @@ def build_positions_from_preset(
     return positions
 
 
-def main(page: ft.Page):
+async def main(page: ft.Page):
     page.title = "オプション戦略 損益グラフ（BS 付き）"
     page.scroll = "adaptive"
     page.padding = 20
 
     page.window.width = 1440
     page.window.height = 900
-    #page.window.min_width = 1024
-    #page.window.min_height = 700
+    page.window.update()
 
-    page.vertical_alignment = ft.MainAxisAlignment.CENTER
-    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+    await page.window.center()
 
     # 状態管理
     state = {

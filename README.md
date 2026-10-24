@@ -2,9 +2,14 @@
 
 このツールは、複数レッグのオプションポジションを組み合わせたときの
 
-**満期時損益曲線** と **ブラック＝ショールズ（BS）理論価格ベースの期中損益曲線** を可視化する Streamlit アプリです。
+**満期時損益曲線** と **ブラック＝ショールズ（BS）理論価格ベースの期中損益曲線** を可視化するアプリです。
 
-日経225や日本株（`XXXX.T`）などのティッカーを指定し、代表的なオプション戦略プリセットを選ぶことで、損益イメージを直感的に確認できます。
+日経 225 や日本株（`XXXX.T`）などのティッカーを指定し、代表的なオプション戦略プリセットを選ぶことで、損益イメージを直感的に確認できます。
+
+**2 つのバージョンを提供しています：**
+
+- **Streamlit 版（`app.py`）**: Web ブラウザベースの簡易版
+- **Flet 版（`app-flet.py`）**: デスクトップ/Web/モバイル対応のクロスプラットフォーム版
 
 ---
 
@@ -31,31 +36,171 @@ pip install -r requirements.txt
 
 `requirements.txt⁠` がない場合は、以下を個別にインストールしてください。
 
+**Streamlit 版の場合：**
+
 ```
 pip install streamlit plotly yfinance scipy numpy
 ```
 
-アプリの起動方法（基本）
+**Flet 版の場合：**
+
+```
+pip install flet matplotlib yfinance scipy numpy
+```
+
+## アプリの起動方法
+
+### Streamlit 版の起動
 
 ローカル開発環境での起動は以下の通りです。
 
-```
+```bash
 cd option-payoff
 streamlit run app.py
-
 ```
 
 実行後、ターミナルに表示される URL（通常は `⁠http://localhost:8501⁠）`をブラウザで開くとアプリが表示されます。
 
-### Mac でのデスクトップアプリ化
+### Flet 版の起動
+
+デスクトップアプリケーションとして起動します。
+
+```bash
+cd option-payoff
+python app-flet.py
+```
+
+実行後、自動的にデスクトップアプリケーションウィンドウが開きます。
+
+**Flet 版の特徴：**
+
+- ネイティブデスクトップアプリとして動作
+- Web 版としても実行可能（コード内で設定変更）
+- iOS/Android アプリにもビルド可能
+- インターネット接続不要（yfinance 使用時を除く）
+
+### Flet 版の Web モードでの起動
+
+デスクトップアプリではなく、Web ブラウザで開きたい場合は、`app-flet.py` の最後の部分を以下のように変更してください。
+
+**変更前：**
+
+```python
+if __name__ == "__main__":
+    ft.app(target=main)
+```
+
+**変更後：**
+
+```python
+if __name__ == "__main__":
+    ft.app(target=main, view=ft.WEB_BROWSER)
+```
+
+これにより、実行時にデフォルトの Web ブラウザで自動的に開きます。
+
+### Flet 版のモバイルアプリ化（iOS/Android）
+
+Flet は Flutter をベースにしているため、iOS および Android のネイティブアプリとしてビルドできます。
+
+#### 前提条件
+
+**iOS の場合：**
+
+- macOS が必要
+- Xcode のインストール（App Store から入手）
+- Apple Developer アカウント（実機テストやリリースの場合）
+
+**Android の場合：**
+
+- Android Studio のインストール
+- Android SDK と NDK の設定
+
+#### モバイルアプリのビルド手順
+
+1. **Flet CLI のインストール**
+
+```bash
+pip install flet
+```
+
+2. **プロジェクトの準備**
+
+モバイルビルド用のメタデータを追加するため、プロジェクトディレクトリに `pyproject.toml` を作成します。
+
+```toml
+[project]
+name = "option-payoff"
+version = "1.0.0"
+description = "オプション戦略損益グラフツール"
+
+[tool.flet]
+app_name = "OptionPayoff"
+org = "com.yourcompany"
+```
+
+3. **Android APK のビルド**
+
+```bash
+flet build apk --project app-flet.py
+```
+
+ビルドが完了すると、`build/apk` ディレクトリに `.apk` ファイルが生成されます。
+
+4. **Android AAB のビルド（Google Play 配布用）**
+
+```bash
+flet build aab --project app-flet.py
+```
+
+5. **iOS IPA のビルド（macOS のみ）**
+
+```bash
+flet build ipa --project app-flet.py
+```
+
+6. **生成されたアプリのインストール**
+
+- **Android**: 生成された `.apk` ファイルを Android デバイスに転送してインストール
+- **iOS**: Xcode を使って実機にインストール、または TestFlight/App Store 経由で配布
+
+#### モバイルビルド時の注意事項
+
+**依存関係の調整**
+
+モバイル環境では一部のライブラリが動作しない場合があります。特に以下に注意が必要です：
+
+- **yfinance**: インターネット接続が必要です。モバイル環境でも動作しますが、ネットワークパーミッションが必要です
+- **matplotlib**: モバイルでも動作しますが、画像の一時保存パスに注意が必要です
+- **numpy/scipy**: ARM アーキテクチャでのコンパイルに時間がかかる場合があります
+
+**UI の調整**
+
+現在の `app-flet.py` はデスクトップ向けのレイアウトになっています。モバイル向けに最適化するには：
+
+1. 画面サイズの検出と応答的なレイアウト
+2. タッチ操作に適したボタンサイズ
+3. スクロール可能なコンテナの活用
+
+モバイル対応版を作成する場合は、`page.width` や `page.platform` を使って動的にレイアウトを調整することをお勧めします。
+
+**パーミッション設定**
+
+インターネットアクセス（yfinance 用）やファイルアクセス（チャート画像保存用）が必要な場合は、Android の `AndroidManifest.xml` や iOS の `Info.plist` にパーミッションを追加する必要があります。
+
+詳細は [Flet 公式ドキュメント](https://flet.dev/docs/guides/python/mobile) を参照してください。
+
+### Mac/Linux でのデスクトップアプリ化（Streamlit 版）
 
 [streamlit-desktop-app](https://zenn.dev/ohtaman/articles/streamlit-desktop-app)を利用して
 作成します。
 詳細についてはリンク先をご確認ください。
 
-### Mac でのデスクトップアプリ化（簡易）
+### Mac でのワンクリック起動（Streamlit 版）
 
 ここでは「ネイティブアプリ」にするのではなく、Streamlit アプリをワンクリックで起動できる 簡易デスクトップアプリ風 の運用方法を説明します。
+
+**注意：Flet 版（`app-flet.py`）を使用する場合は、この手順は不要です。`python app-flet.py` を実行するだけでネイティブアプリとして動作します。**
 
 仮想環境の作成（任意）
 
@@ -113,9 +258,11 @@ cd /path/to/option-payoff
 
 以後は、この `.app⁠ `をダブルクリックするだけでターミナルが立ち上がり、ブラウザでアプリが自動起動します。
 
-### Windows でのデスクトップアプリ化（簡易）
+### Windows でのワンクリック起動（Streamlit 版）
 
 こちらも「ワンクリックで起動する」ためのバッチファイルを用いた簡易的な方法です。
+
+**注意：Flet 版（`app-flet.py`）を使用する場合は、この手順は不要です。`python app-flet.py` を実行するだけでネイティブアプリとして動作します。**
 
 仮想環境の作成（任意）
 

@@ -20,8 +20,48 @@ from scipy.stats import norm
 import yfinance as yf
 import flet as ft
 
+import re
+import unicodedata
+
 OptionType = Literal["call", "put"]
 SideType = Literal["long", "short"]
+
+
+def safe_float(val, default=0.0) -> float:
+    try:
+        def_val = float(default) if default is not None else 0.0
+    except (ValueError, TypeError):
+        def_val = 0.0
+
+    if val is None:
+        return def_val
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return def_val
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace(",", "").replace("¥", "").replace("\\", "").replace(" ", "")
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        cleaned = re.sub(r"[^0-9.-]", "", s)
+        if cleaned.count(".") > 1:
+            parts = cleaned.split(".")
+            cleaned = parts[0] + "." + "".join(parts[1:])
+        try:
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return def_val
+
+
+def safe_int(val, default=1) -> int:
+    try:
+        def_val = int(default) if default is not None else 1
+    except (ValueError, TypeError):
+        def_val = 1
+    f = safe_float(val, default=float(def_val))
+    return int(round(f))
 
 
 def get_last_close(ticker: str) -> float | None:
@@ -366,7 +406,7 @@ def main(page: ft.Page):
     ticker_field = ft.TextField(
         label="原資産ティッカー（例: ^N225, 7203.T）",
         value=state["ticker"],
-        width=300
+        width=270
     )
 
     auto_fetch_check = ft.Checkbox(
@@ -433,13 +473,21 @@ def main(page: ft.Page):
     )
 
     range_slider = ft.Slider(
-        min=1000,
-        max=30000,
-        divisions=58,
+        min=10,
+        max=50000,
         value=state["spot_range"],
         label="{value}",
         expand=True,
     )
+
+    def update_range_slider_bounds(target_val: float):
+        # 目標レンジ幅に合わせて min と max を動的に適正化
+        cur_min = min(float(range_slider.min), target_val * 0.2, 50.0)
+        cur_min = max(5.0, round(cur_min / 5.0) * 5.0)
+        cur_max = max(float(range_slider.max), target_val * 2.5, 1000.0)
+        range_slider.min = cur_min
+        range_slider.max = cur_max
+        range_slider.value = max(cur_min, min(target_val, cur_max))
 
     def update_range_display():
         center = state["spot_center"]
@@ -456,18 +504,17 @@ def main(page: ft.Page):
                 except (ValueError, TypeError):
                     pass
         center = state["spot_center"]
+        strike_step = guess_strike_step_from_ticker(state["ticker"])
         if strikes:
-            max_dist = max([abs(k - center) for k in strikes] + [2000.0])
-            auto_range = float(round((max_dist * 1.5) / 500.0) * 500.0)
-            auto_range = max(auto_range, 3000.0)
+            max_dist = max([abs(k - center) for k in strikes] + [strike_step * 2])
+            auto_range = float(round_to_step(max_dist * 1.5, strike_step))
+            auto_range = max(auto_range, strike_step * 3)
         else:
-            auto_range = 5000.0
+            auto_range = max(float(round_to_step(center * 0.15, strike_step)), strike_step * 5)
 
         state["spot_range"] = auto_range
         spot_range_field.value = str(auto_range)
-        if auto_range > range_slider.max:
-            range_slider.max = auto_range * 1.2
-        range_slider.value = auto_range
+        update_range_slider_bounds(auto_range)
         update_range_display()
         generate_chart()
 
@@ -475,11 +522,17 @@ def main(page: ft.Page):
         update_state_from_fields()
         state["spot_range"] = val
         spot_range_field.value = str(val)
-        if val > range_slider.max:
-            range_slider.max = val * 1.2
-        range_slider.value = val
+        update_range_slider_bounds(val)
         update_range_display()
         generate_chart()
+
+    def set_quick_range_percent(pct: float):
+        update_state_from_fields()
+        center = state["spot_center"]
+        strike_step = guess_strike_step_from_ticker(state["ticker"])
+        val = float(round_to_step(center * (pct / 100.0), strike_step))
+        val = max(val, strike_step * 2)
+        set_quick_range(val)
 
     def on_range_slider_change(e):
         val = float(e.control.value)
@@ -510,11 +563,10 @@ def main(page: ft.Page):
                         icon=ft.Icons.FIT_SCREEN,
                         on_click=set_auto_range
                     ),
-                    ft.OutlinedButton("±2,000", on_click=lambda e: set_quick_range(2000)),
-                    ft.OutlinedButton("±4,000", on_click=lambda e: set_quick_range(4000)),
-                    ft.OutlinedButton("±8,000", on_click=lambda e: set_quick_range(8000)),
-                    ft.OutlinedButton("±15,000", on_click=lambda e: set_quick_range(15000)),
-                    ft.OutlinedButton("±25,000", on_click=lambda e: set_quick_range(25000)),
+                    ft.OutlinedButton("±5%", on_click=lambda e: set_quick_range_percent(5)),
+                    ft.OutlinedButton("±10%", on_click=lambda e: set_quick_range_percent(10)),
+                    ft.OutlinedButton("±20%", on_click=lambda e: set_quick_range_percent(20)),
+                    ft.OutlinedButton("±35%", on_click=lambda e: set_quick_range_percent(35)),
                 ], wrap=True),
             ]),
             padding=15
@@ -544,22 +596,97 @@ def main(page: ft.Page):
         except (ValueError, TypeError):
             pass
 
-    def update_ticker_info(e=None):
-        state["ticker"] = ticker_field.value
-        
+    def update_ticker_info(e=None, force_k_update=True):
+        state["ticker"] = ticker_field.value or "^N225"
+        old_center = state.get("spot_center", 32000.0)
+
+        # 1. yfinance から中心価格を取得
         if auto_fetch_check.value:
             last_close = get_last_close(state["ticker"])
             if last_close is not None:
-                state["spot_center"] = float(round(last_close, -1))
+                new_center = float(round(last_close, -1) if last_close > 1000 else round(last_close, 1))
+                state["spot_center"] = new_center
                 spot_center_field.value = str(state["spot_center"])
-                yfinance_info.value = f"yfinance 終値: 約 {last_close:.2f}"
+                yfinance_info.value = f"yfinance 終値: 約 {last_close:,.2f}"
             else:
                 yfinance_info.value = "価格を取得できませんでした"
-        
+        else:
+            try:
+                state["spot_center"] = float(spot_center_field.value)
+            except (ValueError, TypeError):
+                pass
+
+        center = state["spot_center"]
+
+        # 2. 取引単位 & 刻み幅の推定
         state["contract_size"] = guess_contract_size_from_ticker(state["ticker"])
         contract_size_field.value = str(state["contract_size"])
+
+        strike_step = guess_strike_step_from_ticker(state["ticker"])
+        state["spot_step"] = strike_step
+        spot_step_field.value = str(strike_step)
+
+        # 3. レンジ幅の適正化（価格水準が大幅に変化した場合や、マイナスになる場合に自動調整）
+        suggested_range = float(round_to_step(center * 0.15, strike_step))
+        suggested_range = max(suggested_range, strike_step * 5)
+        if state["spot_range"] >= center or abs(center - old_center) > (old_center * 0.1):
+            state["spot_range"] = suggested_range
+            spot_range_field.value = str(suggested_range)
+            update_range_slider_bounds(suggested_range)
+        else:
+            update_range_slider_bounds(state["spot_range"])
+
+        # 4. 行使価格 K の自動変更
+        if force_k_update:
+            if state.get("preset", StrategyPreset.NONE) != StrategyPreset.NONE:
+                # 戦略プリセットが選択されている場合: 新しい原資産価格で戦略の全レッグを再構築
+                preset_positions = build_positions_from_preset(
+                    preset=state["preset"],
+                    spot_center=center,
+                    contract_size=state["contract_size"],
+                    r=state["r"],
+                    ticker=state["ticker"],
+                )
+                state["n_legs"] = len(preset_positions)
+                legs_slider.value = state["n_legs"]
+                state["legs"] = {}
+                for i, pos in enumerate(preset_positions, start=1):
+                    state["legs"][i] = {
+                        "type": pos.option_type,
+                        "side": pos.side,
+                        "strike": pos.strike,
+                        "premium": pos.premium,
+                        "quantity": pos.quantity,
+                        "sigma": pos.sigma,
+                        "T_days": int(pos.T * 365)
+                    }
+            else:
+                # 手動設定の場合: 新しい原資産価格に合わせて各行使価格をシフト
+                ratio = center / old_center if old_center > 0 else 1.0
+                atm_strike = round_to_step(center, strike_step)
+                for i in range(1, state["n_legs"] + 1):
+                    if i in state["legs"]:
+                        old_k = state["legs"][i].get("strike", old_center)
+                        if old_center > 0 and abs(ratio - 1.0) > 0.03:
+                            # 3%以上の価格変化があれば比率でシフトして刻みに丸める
+                            state["legs"][i]["strike"] = round_to_step(old_k * ratio, strike_step)
+                        elif "strike" not in state["legs"][i]:
+                            state["legs"][i]["strike"] = atm_strike
+                    else:
+                        state["legs"][i] = {
+                            "type": "call",
+                            "side": "long",
+                            "strike": atm_strike,
+                            "premium": 300.0 if center > 10000 else float(round_to_step(center * 0.02, 1.0)),
+                            "quantity": 1,
+                            "sigma": 0.2,
+                            "T_days": 30
+                        }
+
+        # 5. UI再構築 & レンジ表示更新 & グラフ再描画
+        build_legs_ui()
         update_range_display()
-        page.update()
+        generate_chart()
 
     def on_preset_change(e=None):
         val = None
@@ -621,9 +748,6 @@ def main(page: ft.Page):
         page.update()
 
     def build_legs_ui():
-        print("build_legs_ui called; n_legs =", state["n_legs"])
-        print("state['legs'] before:", state["legs"])
-
         legs_container.controls.clear()
         
         for i in range(1, state["n_legs"] + 1):
@@ -674,7 +798,9 @@ def main(page: ft.Page):
                 value=str(leg_data["strike"]),
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
-                on_change=lambda e, idx=i: update_leg(idx, "strike", float(e.control.value) if e.control.value else 0)
+                on_change=lambda e, idx=i: update_leg(
+                    idx, "strike", safe_float(e.control.value, default=state["legs"].get(idx, {}).get("strike", 0.0))
+                )
             )
             
             premium_field = ft.TextField(
@@ -682,7 +808,9 @@ def main(page: ft.Page):
                 value=str(leg_data["premium"]),
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
-                on_change=lambda e, idx=i: update_leg(idx, "premium", float(e.control.value) if e.control.value else 0)
+                on_change=lambda e, idx=i: update_leg(
+                    idx, "premium", safe_float(e.control.value, default=state["legs"].get(idx, {}).get("premium", 0.0))
+                )
             )
             
             quantity_field = ft.TextField(
@@ -690,7 +818,9 @@ def main(page: ft.Page):
                 value=str(leg_data["quantity"]),
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=100,
-                on_change=lambda e, idx=i: update_leg(idx, "quantity", int(float(e.control.value)) if e.control.value else 1)
+                on_change=lambda e, idx=i: update_leg(
+                    idx, "quantity", safe_int(e.control.value, default=state["legs"].get(idx, {}).get("quantity", 1))
+                )
             )
             
             sigma_field = ft.TextField(
@@ -698,7 +828,9 @@ def main(page: ft.Page):
                 value=str(leg_data["sigma"]),
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
-                on_change=lambda e, idx=i: update_leg(idx, "sigma", float(e.control.value) if e.control.value else 0)
+                on_change=lambda e, idx=i: update_leg(
+                    idx, "sigma", safe_float(e.control.value, default=state["legs"].get(idx, {}).get("sigma", 0.2))
+                )
             )
             
             t_days_field = ft.TextField(
@@ -706,7 +838,9 @@ def main(page: ft.Page):
                 value=str(leg_data["T_days"]),
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
-                on_change=lambda e, idx=i: update_leg(idx, "T_days", int(float(e.control.value)) if e.control.value else 0)
+                on_change=lambda e, idx=i: update_leg(
+                    idx, "T_days", safe_int(e.control.value, default=state["legs"].get(idx, {}).get("T_days", 30))
+                )
             )
             
             leg_card = ft.Card(
@@ -843,9 +977,7 @@ def main(page: ft.Page):
             val = float(spot_range_field.value)
             if val > 0:
                 state["spot_range"] = val
-                if val > range_slider.max:
-                    range_slider.max = val * 1.2
-                range_slider.value = min(val, range_slider.max)
+                update_range_slider_bounds(val)
                 update_range_display()
         except (ValueError, TypeError):
             pass
@@ -853,17 +985,19 @@ def main(page: ft.Page):
     def on_spot_center_field_change(e):
         try:
             val = float(spot_center_field.value)
-            if val > 0:
+            if val > 0 and abs(val - state["spot_center"]) > 0.01:
                 state["spot_center"] = val
-                update_range_display()
+                update_ticker_info(force_k_update=True)
         except (ValueError, TypeError):
             pass
 
     # イベントハンドラー設定
-    ticker_field.on_change = update_ticker_info
+    ticker_field.on_submit = lambda e: update_ticker_info(force_k_update=True)
+    ticker_field.on_blur = lambda e: update_ticker_info(force_k_update=True)
+    auto_fetch_check.on_change = lambda e: update_ticker_info(force_k_update=True)
     legs_slider.on_change = on_legs_change
     spot_range_field.on_change = on_spot_range_field_change
-    spot_center_field.on_change = on_spot_center_field_change
+    spot_center_field.on_submit = on_spot_center_field_change
     for ev in ["on_select", "on_change", "on_selected"]:
         if hasattr(preset_dropdown, ev):
             setattr(preset_dropdown, ev, on_preset_change)
@@ -878,7 +1012,14 @@ def main(page: ft.Page):
             ft.Container(
                 content=ft.Column([
                     ft.Text("原資産レンジ設定", size=20, weight=ft.FontWeight.BOLD),
-                    ticker_field,
+                    ft.Row([
+                        ticker_field,
+                        ft.IconButton(
+                            icon=ft.Icons.SEARCH,
+                            tooltip="価格を取得して行使価格Kを更新",
+                            on_click=lambda e: update_ticker_info(force_k_update=True),
+                        )
+                    ]),
                     auto_fetch_check,
                     spot_center_field,
                     yfinance_info,

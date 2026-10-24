@@ -27,6 +27,19 @@ OptionType = Literal["call", "put"]
 SideType = Literal["long", "short"]
 
 
+def sanitize_numeric_text(val) -> str:
+    normalized = unicodedata.normalize("NFKC", str(val or ""))
+    return re.sub(r"[^0-9.-]", "", normalized)
+
+
+def sanitize_numeric_input(e):
+    if e and getattr(e, "control", None):
+        e.control.value = sanitize_numeric_text(e.control.value)
+        e.control.update()
+        return e.control.value
+    return ""
+
+
 def safe_float(val, default=0.0) -> float:
     try:
         def_val = float(default) if default is not None else 0.0
@@ -40,12 +53,11 @@ def safe_float(val, default=0.0) -> float:
     s = str(val).strip()
     if not s:
         return def_val
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace(",", "").replace("¥", "").replace("\\", "").replace(" ", "")
+    s = sanitize_numeric_text(s)
     try:
         return float(s)
     except (ValueError, TypeError):
-        cleaned = re.sub(r"[^0-9.-]", "", s)
+        cleaned = s
         if cleaned.count(".") > 1:
             parts = cleaned.split(".")
             cleaned = parts[0] + "." + "".join(parts[1:])
@@ -424,7 +436,8 @@ async def main(page: ft.Page):
         label="中心となる原資産価格",
         value=str(state["spot_center"]),
         keyboard_type=ft.KeyboardType.NUMBER,
-        width=200
+        width=200,
+        on_change=sanitize_numeric_input,
     )
 
     yfinance_info = ft.Text("")
@@ -440,21 +453,24 @@ async def main(page: ft.Page):
         label="刻み幅",
         value=str(state["spot_step"]),
         keyboard_type=ft.KeyboardType.NUMBER,
-        width=200
+        width=200,
+        on_change=sanitize_numeric_input,
     )
 
     contract_size_field = ft.TextField(
         label="取引単位",
         value=str(state["contract_size"]),
         keyboard_type=ft.KeyboardType.NUMBER,
-        width=200
+        width=200,
+        on_change=sanitize_numeric_input,
     )
 
     r_field = ft.TextField(
         label="無リスク金利 r（年率）",
         value=str(state["r"]),
         keyboard_type=ft.KeyboardType.NUMBER,
-        width=200
+        width=200,
+        on_change=sanitize_numeric_input,
     )
 
     legs_slider = ft.Slider(
@@ -805,7 +821,7 @@ async def main(page: ft.Page):
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
                 on_change=lambda e, idx=i: update_leg(
-                    idx, "strike", safe_float(e.control.value, default=state["legs"].get(idx, {}).get("strike", 0.0))
+                    idx, "strike", safe_float(sanitize_numeric_input(e), default=state["legs"].get(idx, {}).get("strike", 0.0))
                 )
             )
             
@@ -815,7 +831,7 @@ async def main(page: ft.Page):
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
                 on_change=lambda e, idx=i: update_leg(
-                    idx, "premium", safe_float(e.control.value, default=state["legs"].get(idx, {}).get("premium", 0.0))
+                    idx, "premium", safe_float(sanitize_numeric_input(e), default=state["legs"].get(idx, {}).get("premium", 0.0))
                 )
             )
             
@@ -825,7 +841,7 @@ async def main(page: ft.Page):
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=100,
                 on_change=lambda e, idx=i: update_leg(
-                    idx, "quantity", safe_int(e.control.value, default=state["legs"].get(idx, {}).get("quantity", 1))
+                    idx, "quantity", safe_int(sanitize_numeric_input(e), default=state["legs"].get(idx, {}).get("quantity", 1))
                 )
             )
             
@@ -835,7 +851,7 @@ async def main(page: ft.Page):
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
                 on_change=lambda e, idx=i: update_leg(
-                    idx, "sigma", safe_float(e.control.value, default=state["legs"].get(idx, {}).get("sigma", 0.2))
+                    idx, "sigma", safe_float(sanitize_numeric_input(e), default=state["legs"].get(idx, {}).get("sigma", 0.2))
                 )
             )
             
@@ -845,7 +861,7 @@ async def main(page: ft.Page):
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
                 on_change=lambda e, idx=i: update_leg(
-                    idx, "T_days", safe_int(e.control.value, default=state["legs"].get(idx, {}).get("T_days", 30))
+                    idx, "T_days", safe_int(sanitize_numeric_input(e), default=state["legs"].get(idx, {}).get("T_days", 30))
                 )
             )
             
@@ -979,6 +995,7 @@ async def main(page: ft.Page):
         page.update()
 
     def on_spot_range_field_change(e):
+        sanitize_numeric_input(e)
         try:
             val = float(spot_range_field.value)
             if val > 0:
@@ -989,6 +1006,7 @@ async def main(page: ft.Page):
             pass
 
     def on_spot_center_field_change(e):
+        sanitize_numeric_input(e)
         try:
             val = float(spot_center_field.value)
             if val > 0 and abs(val - state["spot_center"]) > 0.01:

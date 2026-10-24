@@ -14,6 +14,7 @@ from typing import List, Literal
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 import numpy as np
 from scipy.stats import norm
 import yfinance as yf
@@ -423,6 +424,103 @@ def main(page: ft.Page):
     chart_container = ft.Column()
     results_text = ft.Text("")
 
+    # 横軸範囲コントロール用UI
+    range_info_text = ft.Text(
+        f"表示範囲: {state['spot_center'] - state['spot_range']:,.0f} 〜 {state['spot_center'] + state['spot_range']:,.0f}（中心: {state['spot_center']:,.0f} ±{state['spot_range']:,.0f}）",
+        size=14,
+        weight=ft.FontWeight.BOLD,
+        color=ft.Colors.BLUE_GREY_700,
+    )
+
+    range_slider = ft.Slider(
+        min=1000,
+        max=30000,
+        divisions=58,
+        value=state["spot_range"],
+        label="{value}",
+        expand=True,
+    )
+
+    def update_range_display():
+        center = state["spot_center"]
+        rng = state["spot_range"]
+        range_info_text.value = f"表示範囲: {center - rng:,.0f} 〜 {center + rng:,.0f}（中心: {center:,.0f} ±{rng:,.0f}）"
+
+    def set_auto_range(e=None):
+        update_state_from_fields()
+        strikes = []
+        for leg in state["legs"].values():
+            if "strike" in leg:
+                try:
+                    strikes.append(float(leg["strike"]))
+                except (ValueError, TypeError):
+                    pass
+        center = state["spot_center"]
+        if strikes:
+            max_dist = max([abs(k - center) for k in strikes] + [2000.0])
+            auto_range = float(round((max_dist * 1.5) / 500.0) * 500.0)
+            auto_range = max(auto_range, 3000.0)
+        else:
+            auto_range = 5000.0
+
+        state["spot_range"] = auto_range
+        spot_range_field.value = str(auto_range)
+        if auto_range > range_slider.max:
+            range_slider.max = auto_range * 1.2
+        range_slider.value = auto_range
+        update_range_display()
+        generate_chart()
+
+    def set_quick_range(val: float):
+        update_state_from_fields()
+        state["spot_range"] = val
+        spot_range_field.value = str(val)
+        if val > range_slider.max:
+            range_slider.max = val * 1.2
+        range_slider.value = val
+        update_range_display()
+        generate_chart()
+
+    def on_range_slider_change(e):
+        val = float(e.control.value)
+        state["spot_range"] = val
+        spot_range_field.value = str(val)
+        update_range_display()
+        generate_chart()
+
+    range_slider.on_change = on_range_slider_change
+
+    range_control_card = ft.Card(
+        content=ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Row([
+                        ft.Icon(ft.Icons.AUTO_GRAPH, color=ft.Colors.PRIMARY),
+                        ft.Text("横軸表示範囲（原資産価格 S）", weight=ft.FontWeight.BOLD, size=16),
+                    ]),
+                    range_info_text,
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                ft.Row([
+                    ft.Text("レンジ幅: ±"),
+                    range_slider,
+                ]),
+                ft.Row([
+                    ft.FilledTonalButton(
+                        "全体表示（自動調整）",
+                        icon=ft.Icons.FIT_SCREEN,
+                        on_click=set_auto_range
+                    ),
+                    ft.OutlinedButton("±2,000", on_click=lambda e: set_quick_range(2000)),
+                    ft.OutlinedButton("±4,000", on_click=lambda e: set_quick_range(4000)),
+                    ft.OutlinedButton("±8,000", on_click=lambda e: set_quick_range(8000)),
+                    ft.OutlinedButton("±15,000", on_click=lambda e: set_quick_range(15000)),
+                    ft.OutlinedButton("±25,000", on_click=lambda e: set_quick_range(25000)),
+                ], wrap=True),
+            ]),
+            padding=15
+        )
+    )
+
     def update_state_from_fields():
         state["ticker"] = ticker_field.value or "^N225"
         try:
@@ -460,7 +558,7 @@ def main(page: ft.Page):
         
         state["contract_size"] = guess_contract_size_from_ticker(state["ticker"])
         contract_size_field.value = str(state["contract_size"])
-        
+        update_range_display()
         page.update()
 
     def on_preset_change(e=None):
@@ -501,9 +599,9 @@ def main(page: ft.Page):
                     "T_days": int(pos.T * 365)
                 }
             
-            # UIを再構築してグラフも再描画
+            # UIを再構築して全体が収まる自動レンジで再描画
             build_legs_ui()
-            generate_chart()
+            set_auto_range()
         else:
             page.update()
 
@@ -660,7 +758,10 @@ def main(page: ft.Page):
         # 計算
         spot_min = state["spot_center"] - state["spot_range"]
         spot_max = state["spot_center"] + state["spot_range"]
-        spots = np.arange(spot_min, spot_max + state["spot_step"], state["spot_step"])
+        
+        # なめらかな曲線を生成（最低 500 点）
+        n_points = max(int((spot_max - spot_min) / 50.0) + 1, 500)
+        spots = np.linspace(spot_min, spot_max, n_points)
 
         total_now = total_pl_now_bs(positions, spots)
         total_maturity = total_payoff_maturity(positions, spots)
@@ -671,8 +772,6 @@ def main(page: ft.Page):
         min_mat = float(np.min(total_maturity))
 
         # チャート作成（matplotlib）
-
-        # 日本語フォント設定（OS別）
         system = platform.system()
         if system == 'Darwin':  # macOS
             plt.rcParams['font.family'] = ['Hiragino Sans', 'Hiragino Maru Gothic Pro', 'AppleGothic']
@@ -683,23 +782,40 @@ def main(page: ft.Page):
 
         plt.rcParams['axes.unicode_minus'] = False  # マイナス記号の文字化け対策
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(spots, total_now, label='Total P/L Now (BS)', color='orange', linewidth=2)
-        ax.plot(spots, total_maturity, label='Total P/L at Maturity', color='blue', linewidth=2, linestyle='--')
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+        ax.plot(spots, total_now, label='期中損益 (BS 理論価格)', color='#ff7f0e', linewidth=2.5)
+        ax.plot(spots, total_maturity, label='満期損益', color='#1f77b4', linewidth=2, linestyle='--')
         ax.axhline(y=0, color='gray', linewidth=1)
-        ax.axvline(x=state["spot_center"], color='green', linewidth=1, linestyle=':')
+        ax.axvline(x=state["spot_center"], color='green', linewidth=1.2, linestyle=':', label=f'中心価格 ({state["spot_center"]:,.0f})')
+
+        # 各レッグの行使価格（K）にマーカー垂直線を引く
+        strikes = sorted(list({p.strike for p in positions}))
+        for k in strikes:
+            if spot_min <= k <= spot_max:
+                ax.axvline(x=k, color='#9467bd', linewidth=0.8, linestyle=':', alpha=0.6)
 
         # 最大利益・損失ライン
-        ax.axhline(y=max_now, color='orange', linewidth=0.8, linestyle=':')
-        ax.axhline(y=min_now, color='orange', linewidth=0.8, linestyle=':')
-        ax.axhline(y=max_mat, color='blue', linewidth=0.8, linestyle=':')
-        ax.axhline(y=min_mat, color='blue', linewidth=0.8, linestyle=':')
+        ax.axhline(y=max_now, color='#ff7f0e', linewidth=0.8, linestyle=':', alpha=0.6)
+        ax.axhline(y=min_now, color='#ff7f0e', linewidth=0.8, linestyle=':', alpha=0.6)
+        ax.axhline(y=max_mat, color='#1f77b4', linewidth=0.8, linestyle=':', alpha=0.6)
+        ax.axhline(y=min_mat, color='#1f77b4', linewidth=0.8, linestyle=':', alpha=0.6)
 
-        ax.set_xlabel('原資産価格 S')
-        ax.set_ylabel('損益')
-        ax.set_title(f'オプション戦略 損益グラフ（原資産: {state["ticker"]}）')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        # 横軸・縦軸のフォーマット改善（3桁カンマ区切り、詳細すぎる目盛りの整理）
+        ax.set_xlim(spot_min, spot_max)
+        ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, p: f"{y:,.0f}"))
+
+        # 目盛りの数を多すぎず（6〜8本程度に）キリの良い数値で自動調整
+        ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10]))
+        ax.tick_params(axis='x', rotation=15, labelsize=9)
+        ax.tick_params(axis='y', labelsize=9)
+
+        ax.set_xlabel('原資産価格 S', fontsize=11)
+        ax.set_ylabel('損益 (円)', fontsize=11)
+        ax.set_title(f'オプション戦略 損益グラフ（原資産: {state["ticker"]}）', fontsize=13, weight='bold')
+        ax.legend(loc='best', framealpha=0.85)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        fig.tight_layout()
 
         # メモリ上にPNG画像として出力し、ft.Image に渡す
         buf = io.BytesIO()
@@ -709,7 +825,7 @@ def main(page: ft.Page):
 
         chart_container.controls.clear()
         chart_container.controls.append(
-            ft.Image(src=img_bytes, width=800, height=480)
+            ft.Image(src=img_bytes, width=800, height=440)
         )
 
         results_text.value = (
@@ -718,12 +834,36 @@ def main(page: ft.Page):
             f"最大利益（満期）: {max_mat:,.0f}\n"
             f"最大損失（満期）: {min_mat:,.0f}"
         )
+        update_range_display()
 
         page.update()
+
+    def on_spot_range_field_change(e):
+        try:
+            val = float(spot_range_field.value)
+            if val > 0:
+                state["spot_range"] = val
+                if val > range_slider.max:
+                    range_slider.max = val * 1.2
+                range_slider.value = min(val, range_slider.max)
+                update_range_display()
+        except (ValueError, TypeError):
+            pass
+
+    def on_spot_center_field_change(e):
+        try:
+            val = float(spot_center_field.value)
+            if val > 0:
+                state["spot_center"] = val
+                update_range_display()
+        except (ValueError, TypeError):
+            pass
 
     # イベントハンドラー設定
     ticker_field.on_change = update_ticker_info
     legs_slider.on_change = on_legs_change
+    spot_range_field.on_change = on_spot_range_field_change
+    spot_center_field.on_change = on_spot_center_field_change
     for ev in ["on_select", "on_change", "on_selected"]:
         if hasattr(preset_dropdown, ev):
             setattr(preset_dropdown, ev, on_preset_change)
@@ -770,6 +910,7 @@ def main(page: ft.Page):
                         icon=ft.Icons.REFRESH
                     ),
                     ft.Divider(),
+                    range_control_card,
                     chart_container,
                     results_text,
                 ], scroll="adaptive"),

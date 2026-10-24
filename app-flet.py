@@ -386,6 +386,14 @@ def main(page: ft.Page):
     page.scroll = "adaptive"
     page.padding = 20
 
+    page.window.width = 1440
+    page.window.height = 900
+    #page.window.min_width = 1024
+    #page.window.min_height = 700
+
+    page.vertical_alignment = ft.MainAxisAlignment.CENTER
+    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+
     # 状態管理
     state = {
         "ticker": "^N225",
@@ -393,7 +401,7 @@ def main(page: ft.Page):
         "spot_range": 4000.0,
         "spot_step": 100.0,
         "contract_size": 1000,
-        "r": 0.0075,
+        "r": 0.75,
         "preset": StrategyPreset.NONE,
         "n_legs": 2,
         "legs": {},

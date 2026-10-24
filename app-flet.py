@@ -2,16 +2,22 @@
 # オプション戦略 損益グラフ（BS 付き）＋ yfinance 原資産
 # Flet版
 
+import io
 import math
-import numpy as np
-import flet as ft
+import os
+import platform
+import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, Literal
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
 from scipy.stats import norm
 import yfinance as yf
-from enum import Enum
-import os
-import tempfile
+import flet as ft
 
 OptionType = Literal["call", "put"]
 SideType = Literal["long", "short"]
@@ -163,13 +169,29 @@ class StrategyPreset(str, Enum):
     CALENDAR_SPREAD = "カレンダー・スプレッド（満期ズレ・時間価値狙い）"
 
 
+def resolve_strategy_preset(val: str | StrategyPreset | None) -> StrategyPreset:
+    if not val:
+        return StrategyPreset.NONE
+    if isinstance(val, StrategyPreset):
+        return val
+    # メンバー名で検索 (例: "LONG_CALL")
+    if val in StrategyPreset.__members__:
+        return StrategyPreset[val]
+    # 値で検索 (例: "ロング・コール（強気）")
+    for p in StrategyPreset:
+        if p.value == val or p.name == val:
+            return p
+    return StrategyPreset.NONE
+
+
 def build_positions_from_preset(
-    preset: StrategyPreset,
+    preset: StrategyPreset | str,
     spot_center: float,
     contract_size: int,
     r: float,
     ticker: str,
 ) -> List[OptionPosition]:
+    preset = resolve_strategy_preset(preset)
     positions: List[OptionPosition] = []
 
     sigma = 0.2
@@ -388,17 +410,6 @@ def main(page: ft.Page):
         width=200
     )
 
-    preset_dropdown = ft.Dropdown(
-      label="戦略プリセット",
-      options=[
-          ft.DropdownOption(key=p.name, text=p.value)   # key: Enum 名, text: 日本語ラベル
-          for p in StrategyPreset
-      ],
-      value=StrategyPreset.NONE.name,
-      width=400
-    )
-
-
     legs_slider = ft.Slider(
         min=1,
         max=6,
@@ -412,45 +423,28 @@ def main(page: ft.Page):
     chart_container = ft.Column()
     results_text = ft.Text("")
 
-
-
-    def on_preset_change(e: ft.Event[ft.Dropdown]):
-      print("on_preset_change fired")
-      print("Dropdown raw value:", e.control.value)
-
-      preset_name = e.control.value  # = preset_dropdown.value と同じ
-      state["preset"] = StrategyPreset[preset_name]
-
-      if state["preset"] != StrategyPreset.NONE:
-          update_state_from_fields()
-          preset_positions = build_positions_from_preset(
-              preset=state["preset"],
-              spot_center=state["spot_center"],
-              contract_size=state["contract_size"],
-              r=state["r"],
-              ticker=state["ticker"],
-          )
-          state["n_legs"] = len(preset_positions)
-          legs_slider.value = state["n_legs"]
-
-          state["legs"] = {}
-          for i, pos in enumerate(preset_positions, start=1):
-              state["legs"][i] = {
-                  "type": pos.option_type,
-                  "side": pos.side,
-                  "strike": pos.strike,
-                  "premium": pos.premium,
-                  "quantity": pos.quantity,
-                  "sigma": pos.sigma,
-                  "T_days": int(pos.T * 365),
-              }
-
-          build_legs_ui()
-
-      page.update()
-
-
-
+    def update_state_from_fields():
+        state["ticker"] = ticker_field.value or "^N225"
+        try:
+            state["spot_center"] = float(spot_center_field.value)
+        except (ValueError, TypeError):
+            pass
+        try:
+            state["spot_range"] = float(spot_range_field.value)
+        except (ValueError, TypeError):
+            pass
+        try:
+            state["spot_step"] = float(spot_step_field.value)
+        except (ValueError, TypeError):
+            pass
+        try:
+            state["contract_size"] = int(float(contract_size_field.value))
+        except (ValueError, TypeError):
+            pass
+        try:
+            state["r"] = float(r_field.value)
+        except (ValueError, TypeError):
+            pass
 
     def update_ticker_info(e=None):
         state["ticker"] = ticker_field.value
@@ -469,24 +463,23 @@ def main(page: ft.Page):
         
         page.update()
 
-    def update_state_from_fields():
-        state["ticker"] = ticker_field.value
-        state["spot_center"] = float(spot_center_field.value)
-        state["spot_range"] = float(spot_range_field.value)
-        state["spot_step"] = float(spot_step_field.value)
-        state["contract_size"] = int(contract_size_field.value)
-        state["r"] = float(r_field.value)
+    def on_preset_change(e=None):
+        val = None
+        if e is not None:
+            if hasattr(e, "control") and e.control and hasattr(e.control, "value") and e.control.value:
+                val = e.control.value
+            elif hasattr(e, "data") and e.data:
+                val = e.data
+        if not val and "preset_dropdown" in locals():
+            val = preset_dropdown.value
 
-    def on_preset_change(e):
-        preset_name = preset_dropdown.value
-        state["preset"] = StrategyPreset[preset_name]
+        selected_preset = resolve_strategy_preset(val)
+        state["preset"] = selected_preset
         
-        print(f"プリセット選択: {preset_name}")  # デバッグ用
-        
-        if state["preset"] != StrategyPreset.NONE:
+        if selected_preset != StrategyPreset.NONE:
             update_state_from_fields()
             preset_positions = build_positions_from_preset(
-                preset=state["preset"],
+                preset=selected_preset,
                 spot_center=state["spot_center"],
                 contract_size=state["contract_size"],
                 r=state["r"],
@@ -494,8 +487,6 @@ def main(page: ft.Page):
             )
             state["n_legs"] = len(preset_positions)
             legs_slider.value = state["n_legs"]
-            
-            print(f"レッグ数: {state['n_legs']}")  # デバッグ用
             
             # レッグデータを初期化
             state["legs"] = {}
@@ -509,12 +500,22 @@ def main(page: ft.Page):
                     "sigma": pos.sigma,
                     "T_days": int(pos.T * 365)
                 }
-                print(f"レッグ {i}: {state['legs'][i]}")  # デバッグ用
             
-            # UIを再構築
+            # UIを再構築してグラフも再描画
             build_legs_ui()
-        
-        page.update()
+            generate_chart()
+        else:
+            page.update()
+
+    preset_dropdown = ft.Dropdown(
+        label="戦略プリセット",
+        options=[
+            ft.dropdown.Option(key=p.name, text=p.value)
+            for p in StrategyPreset
+        ],
+        value=StrategyPreset.NONE.name,
+        width=400,
+    )
 
     def on_legs_change(e):
         state["n_legs"] = int(legs_slider.value)
@@ -551,7 +552,10 @@ def main(page: ft.Page):
                 value=leg_data["type"],
                 width=150,
             )
-            type_dropdown.on_change = lambda e, idx=i: update_leg(idx, "type", e.control.value)
+            type_handler = lambda e, idx=i: update_leg(idx, "type", e.control.value if (e and hasattr(e, "control") and e.control) else type_dropdown.value)
+            for ev in ["on_select", "on_change", "on_selected"]:
+                if hasattr(type_dropdown, ev):
+                    setattr(type_dropdown, ev, type_handler)
             
             side_dropdown = ft.Dropdown(
                 label="売買",
@@ -562,7 +566,10 @@ def main(page: ft.Page):
                 value=leg_data["side"],
                 width=150,
             )
-            side_dropdown.on_change = lambda e, idx=i: update_leg(idx, "side", e.control.value)
+            side_handler = lambda e, idx=i: update_leg(idx, "side", e.control.value if (e and hasattr(e, "control") and e.control) else side_dropdown.value)
+            for ev in ["on_select", "on_change", "on_selected"]:
+                if hasattr(side_dropdown, ev):
+                    setattr(side_dropdown, ev, side_handler)
             
             strike_field = ft.TextField(
                 label="行使価格 K",
@@ -622,60 +629,9 @@ def main(page: ft.Page):
         if leg_idx in state["legs"]:
             state["legs"][leg_idx][field] = value
 
-    def generate_chart(e):
+    def generate_chart(e=None):
         update_state_from_fields()
-        # ... spots, total_now, total_maturity などの計算までは今のままでOK ...
 
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        import platform
-
-        system = platform.system()
-        if system == 'Darwin':
-            plt.rcParams['font.family'] = ['Hiragino Sans', 'Hiragino Maru Gothic Pro', 'AppleGothic']
-        elif system == 'Windows':
-            plt.rcParams['font.family'] = ['MS Gothic', 'Yu Gothic', 'Meiryo']
-        else:
-            plt.rcParams['font.family'] = ['Noto Sans CJK JP', 'IPAGothic', 'DejaVu Sans']
-
-        plt.rcParams['axes.unicode_minus'] = False
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(spots, total_now, label='Total P/L Now (BS)', color='orange', linewidth=2)
-        ax.plot(spots, total_maturity, label='Total P/L at Maturity', color='blue', linewidth=2, linestyle='--')
-        ax.axhline(y=0, color='gray', linewidth=1)
-        ax.axvline(x=state["spot_center"], color='green', linewidth=1, linestyle=':')
-        ax.set_xlabel('原資産価格 S')
-        ax.set_ylabel('損益')
-        ax.set_title(f'オプション戦略 損益グラフ（原資産: {state["ticker"]}）')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-        # ここから「一時ファイル方式」
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
-        fig.savefig(temp_file.name, dpi=100, bbox_inches='tight')
-        plt.close(fig)
-
-        print("graph saved to:", temp_file.name)  # デバッグログ
-
-        chart_container.controls.clear()
-        chart_container.controls.append(
-            ft.Image(src=temp_file.name, width=800, height=480)
-        )
-
-        results_text.value = (
-            f"最大利益（期中）: {max_now:,.0f}\n"
-            f"最大損失（期中）: {min_now:,.0f}\n"
-            f"最大利益（満期）: {max_mat:,.0f}\n"
-            f"最大損失（満期）: {min_mat:,.0f}"
-        )
-
-        page.update()
-
-        # ★絶対に削除しない★
-        # os.unlink(temp_file.name)
-        
         # ポジション構築
         positions = []
         for i in range(1, state["n_legs"] + 1):
@@ -694,31 +650,28 @@ def main(page: ft.Page):
                         T=leg["T_days"] / 365.0
                     )
                 )
-        
+
         if not positions:
             results_text.value = "少なくとも 1 つポジションを入力してください"
+            chart_container.controls.clear()
             page.update()
             return
-        
+
         # 計算
         spot_min = state["spot_center"] - state["spot_range"]
         spot_max = state["spot_center"] + state["spot_range"]
         spots = np.arange(spot_min, spot_max + state["spot_step"], state["spot_step"])
-        
+
         total_now = total_pl_now_bs(positions, spots)
         total_maturity = total_payoff_maturity(positions, spots)
-        
+
         max_now = float(np.max(total_now))
         min_now = float(np.min(total_now))
         max_mat = float(np.max(total_maturity))
         min_mat = float(np.min(total_maturity))
-        
-        # チャート作成（Fletではmatplotlibを使用）
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        import platform
-        
+
+        # チャート作成（matplotlib）
+
         # 日本語フォント設定（OS別）
         system = platform.system()
         if system == 'Darwin':  # macOS
@@ -727,69 +680,53 @@ def main(page: ft.Page):
             plt.rcParams['font.family'] = ['MS Gothic', 'Yu Gothic', 'Meiryo']
         else:  # Linux等
             plt.rcParams['font.family'] = ['Noto Sans CJK JP', 'IPAGothic', 'DejaVu Sans']
-        
+
         plt.rcParams['axes.unicode_minus'] = False  # マイナス記号の文字化け対策
-        
+
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.plot(spots, total_now, label='Total P/L Now (BS)', color='orange', linewidth=2)
         ax.plot(spots, total_maturity, label='Total P/L at Maturity', color='blue', linewidth=2, linestyle='--')
         ax.axhline(y=0, color='gray', linewidth=1)
         ax.axvline(x=state["spot_center"], color='green', linewidth=1, linestyle=':')
+
+        # 最大利益・損失ライン
+        ax.axhline(y=max_now, color='orange', linewidth=0.8, linestyle=':')
+        ax.axhline(y=min_now, color='orange', linewidth=0.8, linestyle=':')
+        ax.axhline(y=max_mat, color='blue', linewidth=0.8, linestyle=':')
+        ax.axhline(y=min_mat, color='blue', linewidth=0.8, linestyle=':')
+
         ax.set_xlabel('原資産価格 S')
         ax.set_ylabel('損益')
         ax.set_title(f'オプション戦略 損益グラフ（原資産: {state["ticker"]}）')
         ax.legend()
         ax.grid(True, alpha=0.3)
-        
 
-        # 画像としてメモリに保存
-        import io
-        import base64
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        # メモリ上にPNG画像として出力し、ft.Image に渡す
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        img_bytes = buf.getvalue()
 
-        def generate_chart(e):
-            ...
-            # fig を作り終わったあと:
+        chart_container.controls.clear()
+        chart_container.controls.append(
+            ft.Image(src=img_bytes, width=800, height=480)
+        )
 
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-            plt.close(fig)
-            buf.seek(0)
-
-            img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-            data_url = f"data:image/png;base64,{img_base64}"
-
-            chart_container.controls.clear()
-            chart_container.controls.append(
-                ft.Image(
-                    src=data_url,      # ← src_base64 ではなく src に data URL を渡す
-                    width=800,
-                    height=480,
-                )
-            )
-
-            page.update()
-
-
-        
         results_text.value = (
             f"最大利益（期中）: {max_now:,.0f}\n"
             f"最大損失（期中）: {min_now:,.0f}\n"
             f"最大利益（満期）: {max_mat:,.0f}\n"
             f"最大損失（満期）: {min_mat:,.0f}"
         )
-        
+
         page.update()
-        
-        # 一時ファイルを削除
-        # os.unlink(temp_file.name)
 
     # イベントハンドラー設定
     ticker_field.on_change = update_ticker_info
-    preset_dropdown.on_select = on_preset_change
     legs_slider.on_change = on_legs_change
+    for ev in ["on_select", "on_change", "on_selected"]:
+        if hasattr(preset_dropdown, ev):
+            setattr(preset_dropdown, ev, on_preset_change)
 
     # 初期レッグUI構築
     build_legs_ui()
@@ -842,8 +779,9 @@ def main(page: ft.Page):
         ], expand=True)
     )
     
-    # 初期情報更新
+    # 初期情報更新 & 初回グラフ描画
     update_ticker_info()
+    generate_chart()
 
 
 if __name__ == "__main__":

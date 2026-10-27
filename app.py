@@ -449,8 +449,8 @@ def main():
     )
 
     r = st.sidebar.number_input(
-        "無リスク金利 r（年率, 例: 0.0075 = 75%）",
-        value=0.75,
+        "無リスク金利 r（年率, 例: 0.0075 = 0.75%）",
+        value=0.0075,
         step=0.001,
         format="%.4f"
     )

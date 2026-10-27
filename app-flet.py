@@ -411,7 +411,7 @@ async def main(page: ft.Page):
         "spot_range": 4000.0,
         "spot_step": 100.0,
         "contract_size": 1000,
-        "r": 0.75,
+        "r": 0.0075,
         "preset": StrategyPreset.NONE,
         "n_legs": 2,
         "legs": {},
@@ -466,7 +466,7 @@ async def main(page: ft.Page):
     )
 
     r_field = ft.TextField(
-        label="無リスク金利 r（年率）",
+        label="無リスク金利 r（年率, 例: 0.0075 = 0.75%）",
         value=str(state["r"]),
         keyboard_type=ft.KeyboardType.NUMBER,
         width=200,

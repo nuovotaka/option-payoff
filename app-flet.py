@@ -220,6 +220,8 @@ class StrategyPreset(str, Enum):
     CASH_SECURED_PUT = "キャッシュ・セキュアード・プット（安値での指値買い代用）"
     PUT_RATIO_SPREAD = "プット・レシオ・スプレッド（限定的な下落〜横ばい）"
     CALENDAR_SPREAD = "カレンダー・スプレッド（満期ズレ・時間価値狙い）"
+    JADE_LIZARD = "ジェイド・リザード（レンジ〜やや強気・上値限定）"
+    SAFE_JADE_LIZARD = "ジェイド・リザード（安全版・両サイド損失限定）"
 
 
 def resolve_strategy_preset(val: str | StrategyPreset | None) -> StrategyPreset:
@@ -388,6 +390,33 @@ def build_positions_from_preset(
         )
         positions.append(
             OptionPosition("call", "long", k_atm, 250.0, 1, contract_size, r, sigma, T_long)
+        )
+    elif preset == StrategyPreset.JADE_LIZARD:
+        # シンプルなジェイド・リザード：
+        # プット売り（k_low）＋ショート・コール・スプレッド（k_high〜k_very_high）
+        positions.append(
+            OptionPosition("put", "short", k_low, 260.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "short", k_high, 220.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "long", k_very_high, 120.0, 1, contract_size, r, sigma, T_short)
+        )
+    elif preset == StrategyPreset.SAFE_JADE_LIZARD:
+        # 安全版ジェイド・リザード：
+        # ジェイド・リザード＋遠いプット買いで下もスプレッド化（両サイド損失限定）
+        positions.append(
+            OptionPosition("put", "short", k_low, 240.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("put", "long", k_very_low, 120.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "short", k_high, 220.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "long", k_very_high, 120.0, 1, contract_size, r, sigma, T_short)
         )
 
     return positions

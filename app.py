@@ -180,6 +180,10 @@ class StrategyPreset(str, Enum):
     PUT_RATIO_SPREAD = "プット・レシオ・スプレッド（限定的な下落〜横ばい）"
     CALENDAR_SPREAD = "カレンダー・スプレッド（満期ズレ・時間価値狙い）"
 
+    # ジェイド・リザード系
+    JADE_LIZARD = "ジェイド・リザード（レンジ〜やや強気・上値限定）"
+    SAFE_JADE_LIZARD = "ジェイド・リザード（安全版・両サイド損失限定）"
+
 
 def build_positions_from_preset(
     preset: StrategyPreset,
@@ -334,7 +338,7 @@ def build_positions_from_preset(
             OptionPosition("put", "long", k_low, 150.0, 1, contract_size, r, sigma, T_short)
         )
 
-    # ---- 現物組み合わせ・ヘッジ系（オプション部分のみ） ----
+    # ---- 現物組み合わせ・ヘッジ系（オプション部分のみ）----
     elif preset == StrategyPreset.COVERED_CALL:
         # 本来は「現物ロング + OTM コールショート」
         # ここでは OTM コールショートだけを描画
@@ -381,6 +385,36 @@ def build_positions_from_preset(
         )
         positions.append(
             OptionPosition("call", "long", k_atm, 250.0, 1, contract_size, r, sigma, T_long)
+        )
+
+    # ---- ジェイド・リザード系 ----
+    elif preset == StrategyPreset.JADE_LIZARD:
+        # シンプルなジェイド・リザード：
+        # プット売り（k_low）＋ショート・コール・スプレッド（k_high〜k_very_high）
+        positions.append(
+            OptionPosition("put", "short", k_low, 260.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "short", k_high, 220.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "long", k_very_high, 120.0, 1, contract_size, r, sigma, T_short)
+        )
+
+    elif preset == StrategyPreset.SAFE_JADE_LIZARD:
+        # 安全版ジェイド・リザード：
+        # ジェイド・リザードに加え、さらに外側のプット買いで下もスプレッド化（両サイド損失限定）
+        positions.append(
+            OptionPosition("put", "short", k_low, 240.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("put", "long", k_very_low, 120.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "short", k_high, 220.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "long", k_very_high, 120.0, 1, contract_size, r, sigma, T_short)
         )
 
     return positions

@@ -150,6 +150,23 @@ class OptionPosition:
     sigma: float = 0.2
     T: float = 0.1
 
+    def get_tag_style_for_position(pos: OptionPosition):
+        if pos.option_type == "call":
+            base_color = "#22c55e"  # 緑
+        else:
+            base_color = "#ef4444"  # 赤
+
+        if pos.side == "short":
+            facecolor = base_color
+            edgecolor = "white"
+            textcolor = "white"
+        else:
+            facecolor = "none"
+            edgecolor = base_color
+            textcolor = base_color
+
+        return facecolor, edgecolor, textcolor
+
     def payoff_at_maturity(self, S: np.ndarray) -> np.ndarray:
         if self.option_type == "call":
             intrinsic = np.maximum(S - self.strike, 0.0)
@@ -182,6 +199,29 @@ class OptionPosition:
 
         pl_per_contract = position_value_now + initial_cf_per_contract
         return pl_per_contract * self.quantity * self.contract_size
+
+
+def get_tag_style_for_position(pos: OptionPosition):
+    """
+    Call/Put × Long/Short で、ストライクタグの色と塗り分けを決める。
+    """
+    if pos.option_type == "call":
+        base_color = "#22c55e"  # 緑
+    else:
+        base_color = "#ef4444"  # 赤
+
+    if pos.side == "short":
+        # ショートは塗りつぶし＋白文字
+        facecolor = base_color
+        edgecolor = "white"
+        textcolor = "white"
+    else:
+        # ロングは枠線だけ＋色文字
+        facecolor = "none"
+        edgecolor = base_color
+        textcolor = base_color
+
+    return facecolor, edgecolor, textcolor
 
 
 def total_payoff_maturity(positions: List[OptionPosition], S: np.ndarray) -> np.ndarray:
@@ -974,10 +1014,48 @@ async def main(page: ft.Page):
         ax.axvline(x=state["spot_center"], color='green', linewidth=1.2, linestyle=':', label=f'中心価格 ({state["spot_center"]:,.0f})')
 
         # 各レッグの行使価格（K）にマーカー垂直線を引く
-        strikes = sorted(list({p.strike for p in positions}))
-        for k in strikes:
-            if spot_min <= k <= spot_max:
-                ax.axvline(x=k, color='#9467bd', linewidth=0.8, linestyle=':', alpha=0.6)
+        # strikes = sorted(list({p.strike for p in positions}))
+        # for k in strikes:
+        #     if spot_min <= k <= spot_max:
+        #         ax.axvline(x=k, color='#9467bd', linewidth=0.8, linestyle=':', alpha=0.6)
+
+
+        # 各レッグの行使価格（K）にタグ＋縦線を引く（theta PROFITS 風）
+        # まず y 範囲を取得して、タグを載せる高さを決める
+        fig.canvas.draw()
+        y_min_ax, y_max_ax = ax.get_ylim()
+        tag_y = y_max_ax * 0.9  # グラフ上部 90% あたり
+
+        for pos in positions:
+            k = pos.strike
+            if not (spot_min <= k <= spot_max):
+                continue
+
+            # ラベル文字列 例: 63250C, 62000P
+            label = f"{int(k)}{'C' if pos.option_type == 'call' else 'P'}"
+
+            facecolor, edgecolor, textcolor = get_tag_style_for_position(pos)
+
+            # タグ本体
+            ax.text(
+                k, tag_y, label,
+                ha="center", va="center",
+                color=textcolor,
+                fontsize=8,
+                bbox=dict(
+                    boxstyle="round,pad=0.3",
+                    facecolor=facecolor,
+                    edgecolor=edgecolor,
+                    linewidth=1.0,
+                )
+            )
+
+            # 縦のガイドライン
+            ax.axvline(x=k, color=edgecolor, linewidth=0.8, linestyle=":", alpha=0.6)
+
+        # タグが切れないように少しだけ上に余裕を足す
+        ax.set_ylim(y_min_ax, y_max_ax * 1.15)
+
 
         # 最大利益・損失ライン
         ax.axhline(y=max_now, color='#ff7f0e', linewidth=0.8, linestyle=':', alpha=0.6)

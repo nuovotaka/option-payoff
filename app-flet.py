@@ -552,6 +552,7 @@ async def main(page: ft.Page):
     )
 
     legs_container = ft.Column()
+    strike_dials_container = ft.Column()  # ストライクダイヤル用
     chart_container = ft.Column()
     results_text = ft.Text("")
 
@@ -948,6 +949,62 @@ async def main(page: ft.Page):
             
             legs_container.controls.append(leg_card)
 
+        build_strike_dials_ui()
+
+
+    def build_strike_dials_ui():
+        """
+        グラフ上部に、各レッグのストライクを操作する横スライダーを並べる。
+        """
+        strike_dials_container.controls.clear()
+
+        if not state["legs"]:
+            return
+
+        spot_min = state["spot_center"] - state["spot_range"]
+        spot_max = state["spot_center"] + state["spot_range"]
+        step = guess_strike_step_from_ticker(state["ticker"])
+
+        for i in range(1, state["n_legs"] + 1):
+            if i not in state["legs"]:
+                continue
+            leg = state["legs"][i]
+            k = float(leg.get("strike", state["spot_center"]))
+            k = max(spot_min, min(k, spot_max))
+
+            # on_change でこのレッグの strike を更新してグラフ再描画
+            def on_dial_change(e, idx=i):
+                val = safe_float(e.control.value, default=state["legs"][idx]["strike"])
+                # 刻みに丸め
+                new_k = round_to_step(val, step)
+                state["legs"][idx]["strike"] = new_k
+                # レッグ入力カード側も同期させたいなら再構築
+                build_legs_ui()
+                generate_chart()
+
+            dial = ft.Slider(
+                min=spot_min,
+                max=spot_max,
+                value=k,
+                label="{value}",
+                divisions=int(max(1, (spot_max - spot_min) / step)),
+                on_change=on_dial_change,
+                expand=True,
+            )
+
+            # ラベルは「レッグ番号 + C/P + Long/Short + 現在ストライク」
+            label_text = f"Leg {i}: {leg['type'][0].upper()}/{leg['side'][0].upper()}  K={k:,.0f}"
+
+            strike_dials_container.controls.append(
+                ft.Column(
+                    [
+                        ft.Text(label_text, size=12),
+                        dial,
+                    ]
+                )
+            )
+
+
     def update_leg(leg_idx, field, value):
         if leg_idx in state["legs"]:
             state["legs"][leg_idx][field] = value
@@ -1183,6 +1240,7 @@ async def main(page: ft.Page):
                     ),
                     ft.Divider(),
                     range_control_card,
+                    strike_dials_container,
                     chart_container,
                     results_text,
                 ], scroll="adaptive"),

@@ -4,8 +4,11 @@
 # プレミアムは常に正の値で入力
 # K は銘柄ごとの刻み幅（株式100円 / N225系125円 / TOPIX系25円）で、
 # ティッカー or 中心価格変更時にだけ自動初期化（session_state 利用）
+# Flet版機能を追加：数値入力正規化、横軸範囲コントロール強化、ストライクタグ表示
 
 import math
+import re
+import unicodedata
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
@@ -18,6 +21,50 @@ from enum import Enum
 
 OptionType = Literal["call", "put"]
 SideType = Literal["long", "short"]
+
+
+def sanitize_numeric_text(val) -> str:
+    """全角数字・記号を半角に正規化し、数値以外を除去"""
+    normalized = unicodedata.normalize("NFKC", str(val or ""))
+    return re.sub(r"[^0-9.-]", "", normalized)
+
+
+def safe_float(val, default=0.0) -> float:
+    """文字列を安全にfloatに変換"""
+    try:
+        def_val = float(default) if default is not None else 0.0
+    except (ValueError, TypeError):
+        def_val = 0.0
+
+    if val is None:
+        return def_val
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return def_val
+    s = sanitize_numeric_text(s)
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        cleaned = s
+        if cleaned.count(".") > 1:
+            parts = cleaned.split(".")
+            cleaned = parts[0] + "." + "".join(parts[1:])
+        try:
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return def_val
+
+
+def safe_int(val, default=1) -> int:
+    """文字列を安全にintに変換"""
+    try:
+        def_val = int(default) if default is not None else 1
+    except (ValueError, TypeError):
+        def_val = 1
+    f = safe_float(val, default=float(def_val))
+    return int(round(f))
 
 
 def get_last_close(ticker: str) -> float | None:
@@ -93,6 +140,20 @@ class OptionPosition:
     r: float = 0.0
     sigma: float = 0.2
     T: float = 0.1
+
+    def get_tag_color(self):
+        """Call/Put × Long/Short でタグの色と塗りを決定"""
+        if self.option_type == "call":
+            base_color = "#22c55e"  # 緑
+        else:
+            base_color = "#ef4444"  # 赤
+
+        if self.side == "short":
+            # ショートは塗りつぶし
+            return base_color, "white"
+        else:
+            # ロングは枠線のみ
+            return "white", base_color
 
     def payoff_at_maturity(self, S: np.ndarray) -> np.ndarray:
         if self.option_type == "call":
@@ -421,7 +482,14 @@ def build_positions_from_preset(
 
 
 def main():
+    st.set_page_config(page_title="オプション戦略 損益グラフ", layout="wide")
     st.title("オプション戦略 損益グラフ（BS 付き）")
+
+    # session_stateの初期化
+    if "spot_range" not in st.session_state:
+        st.session_state["spot_range"] = 4000.0
+    if "auto_range_enabled" not in st.session_state:
+        st.session_state["auto_range_enabled"] = False
 
     # --- サイドバー: 原資産 & レンジ設定 ---
     st.sidebar.header("原資産レンジ設定")
@@ -457,11 +525,40 @@ def main():
             step=100.0
         )
 
+    # 横軸範囲コントロール（拡張版）
+    st.sidebar.subheader("横軸表示範囲")
+    
+    # 自動調整ボタン
+    if st.sidebar.button("🎯 全体表示（自動調整）"):
+        st.session_state["auto_range_enabled"] = True
+    
+    # クイック範囲選択ボタン
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        if st.button("±5%"):
+            st.session_state["spot_range"] = spot_center * 0.05
+            st.session_state["auto_range_enabled"] = False
+        if st.button("±10%"):
+            st.session_state["spot_range"] = spot_center * 0.10
+            st.session_state["auto_range_enabled"] = False
+    with col2:
+        if st.button("±20%"):
+            st.session_state["spot_range"] = spot_center * 0.20
+            st.session_state["auto_range_enabled"] = False
+        if st.button("±35%"):
+            st.session_state["spot_range"] = spot_center * 0.35
+            st.session_state["auto_range_enabled"] = False
+    
     spot_range = st.sidebar.number_input(
-        "上下レンジ幅（例: 4000 → ±4000）",
-        value=4000.0,
-        step=500.0
+        "上下レンジ幅（±）",
+        value=float(st.session_state["spot_range"]),
+        step=500.0,
+        min_value=100.0
     )
+    st.session_state["spot_range"] = spot_range
+    
+    st.sidebar.caption(f"表示範囲: {spot_center - spot_range:,.0f} 〜 {spot_center + spot_range:,.0f}")
+    
     spot_step = st.sidebar.number_input(
         "刻み幅（グラフ用の S の刻み）",
         value=100.0,
@@ -561,8 +658,43 @@ def main():
 
     positions: List[OptionPosition] = []
 
+    # --- pending strikeの反映（widgetインスタンス化の前に実行）---
+    for i in range(1, n_legs + 1):
+        pending_key = f"_pending_strike_{i}"
+        state_key = f"strike_{i}"
+        if pending_key in st.session_state:
+            st.session_state[state_key] = st.session_state[pending_key]
+            del st.session_state[pending_key]
+
     # --- メイン: 各レッグ入力 ---
     st.subheader("ポジション入力")
+
+    # ストライク価格の視覚的表示
+    if n_legs > 0:
+        st.markdown("#### ストライク価格の分布")
+        strike_info = []
+        for i in range(1, n_legs + 1):
+            state_key = f"strike_{i}"
+            if state_key in st.session_state:
+                strike_val = st.session_state[state_key]
+                type_key = f"type_{i}"
+                side_key = f"side_{i}"
+                opt_type = st.session_state.get(type_key, "call")
+                side = st.session_state.get(side_key, "long")
+                strike_info.append((strike_val, opt_type, side, i))
+        
+        if strike_info:
+            strike_info.sort(key=lambda x: x[0])
+            cols = st.columns(len(strike_info))
+            for idx, (strike_val, opt_type, side, leg_num) in enumerate(strike_info):
+                with cols[idx]:
+                    color = "🟢" if opt_type == "call" else "🔴"
+                    style = "買" if side == "long" else "売"
+                    st.metric(
+                        label=f"レッグ {leg_num}",
+                        value=f"{strike_val:,.0f}",
+                        delta=f"{color} {opt_type.upper()} {style}"
+                    )
 
     for i in range(1, n_legs + 1):
         with st.expander(f"レッグ {i} の設定", expanded=(i == 1)):
@@ -582,6 +714,8 @@ def main():
             with col3:
                 strike_step = guess_strike_step_from_ticker(ticker)
                 state_key = f"strike_{i}"
+                
+                # 初期化
                 if state_key not in st.session_state:
                     st.session_state[state_key] = round_to_step(spot_center, strike_step)
 
@@ -642,11 +776,93 @@ def main():
 
     st.markdown("---")
 
+    # --- ストライクダイヤル（全レッグ統合版）---
+    st.subheader("🎯 ストライク価格ダイヤル調整")
+    st.caption("スライダーで各レッグのストライク価格を視覚的に調整できます")
+    
+    strike_step = guess_strike_step_from_ticker(ticker)
+    dial_min = spot_center * 0.7
+    dial_max = spot_center * 1.3
+    
+    for i in range(1, n_legs + 1):
+        state_key = f"strike_{i}"
+        if state_key not in st.session_state:
+            continue
+            
+        col_label, col_slider, col_buttons = st.columns([1, 3, 2])
+        
+        with col_label:
+            opt_type = st.session_state.get(f"type_{i}", "call")
+            side = st.session_state.get(f"side_{i}", "long")
+            color = "🟢" if opt_type == "call" else "🔴"
+            style = "買" if side == "long" else "売"
+            st.markdown(f"**レッグ {i}**  \n{color} {opt_type.upper()} {style}")
+        
+        with col_slider:
+            # ダイヤル専用のキーを使用
+            dial_key = f"strike_dial_{i}"
+            current_strike = st.session_state.get(state_key, spot_center)
+            
+            # on_changeコールバックで更新
+            def update_strike_from_dial(leg_num=i):
+                dial_k = f"strike_dial_{leg_num}"
+                strike_k = f"strike_{leg_num}"
+                if dial_k in st.session_state:
+                    # 次回のレンダリング時に反映されるように別キーに保存
+                    st.session_state[f"_pending_strike_{leg_num}"] = st.session_state[dial_k]
+            
+            st.slider(
+                f"ストライク調整 (現在: {current_strike:,.0f})",
+                min_value=dial_min,
+                max_value=dial_max,
+                value=float(current_strike),
+                step=strike_step,
+                key=dial_key,
+                format="%.0f",
+                label_visibility="collapsed",
+                on_change=update_strike_from_dial,
+                args=(i,)
+            )
+        
+        with col_buttons:
+            col_atm, col_otm_low, col_otm_high = st.columns(3)
+            
+            def set_strike_value(leg_num, multiplier):
+                new_val = round_to_step(spot_center * multiplier, strike_step)
+                st.session_state[f"_pending_strike_{leg_num}"] = new_val
+                st.session_state[f"strike_dial_{leg_num}"] = new_val
+            
+            with col_atm:
+                st.button("ATM", key=f"atm_{i}", help="At The Money",
+                         on_click=set_strike_value, args=(i, 1.0))
+            with col_otm_low:
+                st.button("-5%", key=f"otm_low_{i}", help="5%下のOTM",
+                         on_click=set_strike_value, args=(i, 0.95))
+            with col_otm_high:
+                st.button("+5%", key=f"otm_high_{i}", help="5%上のOTM",
+                         on_click=set_strike_value, args=(i, 1.05))
+
+    st.markdown("---")
+
     # --- グラフ描画 ---
-    if st.button("グラフを更新"):
+    if st.button("グラフを更新", type="primary"):
         if not positions:
             st.warning("少なくとも 1 つポジションを入力してください。")
             return
+
+        # 自動範囲調整が有効な場合
+        if st.session_state.get("auto_range_enabled", False):
+            strikes = [p.strike for p in positions]
+            if strikes:
+                strike_step = guess_strike_step_from_ticker(ticker)
+                max_dist = max([abs(k - spot_center) for k in strikes] + [strike_step * 2])
+                auto_range = float(round_to_step(max_dist * 1.5, strike_step))
+                auto_range = max(auto_range, strike_step * 3)
+                st.session_state["spot_range"] = auto_range
+                spot_range = auto_range
+                spots = np.arange(spot_center - spot_range, spot_center + spot_range + spot_step, spot_step)
+                st.session_state["auto_range_enabled"] = False
+                st.rerun()
 
         total_now = total_pl_now_bs(positions, spots)
         total_maturity = total_payoff_maturity(positions, spots)
@@ -680,6 +896,36 @@ def main():
 
         fig.add_hline(y=0, line_color="gray", line_width=1)
         fig.add_vline(x=spot_center, line_color="green", line_width=1, line_dash="dot")
+
+        # ストライク価格に縦線とタグを追加
+        for pos in positions:
+            bgcolor, textcolor = pos.get_tag_color()
+            label_text = f"{pos.option_type[0].upper()}{pos.strike:,.0f}"
+            if pos.side == "short":
+                label_text += "売"
+            else:
+                label_text += "買"
+            
+            fig.add_vline(
+                x=pos.strike,
+                line_color=textcolor if pos.side == "long" else bgcolor,
+                line_width=1,
+                line_dash="dot",
+                opacity=0.5
+            )
+            
+            # ストライクラベルをアノテーションで追加
+            fig.add_annotation(
+                x=pos.strike,
+                y=max_now * 0.9,
+                text=label_text,
+                showarrow=False,
+                bgcolor=bgcolor,
+                bordercolor=textcolor,
+                font=dict(color=textcolor, size=10),
+                borderwidth=2,
+                borderpad=4
+            )
 
         fig.add_hline(
             y=max_now,
@@ -721,23 +967,26 @@ def main():
             yaxis_title="損益",
             template="plotly_white",
             legend=dict(x=0.01, y=0.99),
+            height=600
         )
 
         st.plotly_chart(fig, use_container_width=True)
 
-        st.caption(
-            "オレンジ実線: 期中（BS 理論価格） / "
-            "青破線: 満期損益 / 緑点線: 中心価格 / "
-            "点線水平: 最大利益・最大損失ライン"
-        )
+        # サマリー情報を見やすく表示
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("最大利益(期中)", f"{max_now:,.0f}")
+        with col2:
+            st.metric("最大損失(期中)", f"{min_now:,.0f}")
+        with col3:
+            st.metric("最大利益(満期)", f"{max_mat:,.0f}")
+        with col4:
+            st.metric("最大損失(満期)", f"{min_mat:,.0f}")
 
-        st.write(
-            {
-                "最大利益_期中": max_now,
-                "最大損失_期中": min_now,
-                "最大利益_満期": max_mat,
-                "最大損失_満期": min_mat,
-            }
+        st.caption(
+            "🟠 オレンジ実線: 期中（BS 理論価格） / "
+            "🔵 青破線: 満期損益 / 🟢 緑点線: 中心価格 / "
+            "⚪ 点線: ストライク価格"
         )
 
 

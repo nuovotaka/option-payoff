@@ -67,14 +67,56 @@ def safe_int(val, default=1) -> int:
     return int(round(f))
 
 
+def normalize_ticker_for_yfinance(raw: str) -> str:
+    """
+    ユーザー入力を yfinance 用の正式ティッカーに正規化する。
+    例:
+      "7203"    -> "7203.T"
+      "7203.T"  -> "7203.T"
+      "n225"    -> "^N225"
+      "topx"/"tpx" -> "^TOPX"（必要に応じて変更）
+    """
+    if not raw:
+        return raw
+
+    s = raw.strip()
+    u = s.upper()
+
+    # すでに ^ や .T などが付いていれば、そのまま使う
+    if u.startswith("^"):
+        return s
+    if u.endswith(".T"):
+        return s
+
+    # 日経225
+    if u in ("N225", "NI225", "NK225", "NKI"):
+        return "^N225"
+
+    # TOPIX
+    if u in ("TOPX", "TOPIX", "TPX"):
+        return "^TOPX"  # 必要に応じて別コードに変更
+
+    # 数字だけなら日本株コードとみなして .T を付ける
+    if u.isdigit():
+        return f"{u}.T"
+
+    # デフォルトはそのまま返す
+    return s
+
+
 def get_last_close(ticker: str) -> float | None:
+    """
+    入力ティッカーを正規化してから yfinance で直近終値を取得する。
+    """
     try:
-        data = yf.Ticker(ticker).history(period="5d")
+        norm = normalize_ticker_for_yfinance(ticker)
+        data = yf.Ticker(norm).history(period="5d")
         if data.empty:
             return None
         return float(data["Close"].iloc[-1])
     except Exception:
         return None
+
 
 
 def guess_contract_size_from_ticker(ticker: str) -> int:
@@ -101,6 +143,13 @@ def round_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return round(x / step) * step
+
+
+def ceil_to_step(x: float, step: float) -> float:
+    """常に上側の刻みにそろえる（ATM を上側Kとみなしたいとき用）"""
+    if step <= 0:
+        return x
+    return math.ceil(x / step) * step
 
 
 def bs_price(
@@ -220,6 +269,8 @@ class StrategyPreset(str, Enum):
     BEAR_PUT_SPREAD = "ベア・プット・スプレッド（緩やかな弱気）"
     BULL_PUT_SPREAD = "ブル・プット・スプレッド（クレジット・強気〜横ばい）"
     BEAR_CALL_SPREAD = "ベア・コール・スプレッド（クレジット・弱気〜横ばい）"
+    ATM_BULL_PUT_CREDIT_SPREAD = "ATM ブル・プット・クレジット・スプレッド"
+    ATM_BEAR_CALL_CREDIT_SPREAD = "ATM ベア・コール・クレジット・スプレッド"
 
     # ボラティリティ系（変動狙い）
     LONG_STRADDLE = "ロング・ストラドル（変動大きめ予想）"
@@ -265,7 +316,9 @@ def build_positions_from_preset(
     T_long = 90 / 365       # 遠い満期（カレンダー用など）
 
     step = guess_strike_step_from_ticker(ticker)
-    k_atm = round_to_step(spot_center, step)
+    k_atm = ceil_to_step(spot_center, step)
+    k_down1 = k_atm - step
+    k_up1 = k_atm + step
     k_low = round_to_step(spot_center * 0.95, step)
     k_high = round_to_step(spot_center * 1.05, step)
     k_very_low = round_to_step(spot_center * 0.9, step)
@@ -327,6 +380,26 @@ def build_positions_from_preset(
         )
         positions.append(
             OptionPosition("call", "long", k_high, 200.0, 1, contract_size, r, sigma, T_short)
+        )
+
+    elif preset == StrategyPreset.ATM_BULL_PUT_CREDIT_SPREAD:
+        # atm ブル・プット・クレジット・スプレッド
+        # 現在価格付近(ATM)のプットを売り、その1ストライク下のプットを買う
+        positions.append(
+            OptionPosition("put", "short", k_atm, 260.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("put", "long", k_down1, 140.0, 1, contract_size, r, sigma, T_short)
+        )
+
+    elif preset == StrategyPreset.ATM_BEAR_CALL_CREDIT_SPREAD:
+        # atm ベア・コール・クレジット・スプレッド
+        # 現在価格付近(ATM)のコールを売り、その1ストライク上のコールを買う
+        positions.append(
+            OptionPosition("call", "short", k_atm, 260.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "long", k_up1, 140.0, 1, contract_size, r, sigma, T_short)
         )
 
     # ---- ボラティリティ系 ----
@@ -637,10 +710,12 @@ def main():
         st.session_state["prev_spot_center"] = spot_center
 
         strike_step_for_init = guess_strike_step_from_ticker(ticker)
-        default_strike_for_init = round_to_step(spot_center, strike_step_for_init)
+        default_strike_for_init = ceil_to_step(spot_center, strike_step_for_init)
 
         for i in range(1, n_legs + 1):
             st.session_state[f"strike_{i}"] = default_strike_for_init
+            st.session_state[f"strike_dial_{i}"] = default_strike_for_init
+
 
     # --- プリセット変更時: session_state を上書きしてレッグを同期 ---
     if preset_changed and preset_positions is not None:
@@ -656,15 +731,11 @@ def main():
             st.session_state[f"sigma_{i}"] = base.sigma
             st.session_state[f"Tdays_{i}"] = int(base.T * 365)
 
+            # ダイヤルも同じ値にそろえる
+            st.session_state[f"strike_dial_{i}"] = base.strike
+
     positions: List[OptionPosition] = []
 
-    # --- pending strikeの反映（widgetインスタンス化の前に実行）---
-    for i in range(1, n_legs + 1):
-        pending_key = f"_pending_strike_{i}"
-        state_key = f"strike_{i}"
-        if pending_key in st.session_state:
-            st.session_state[state_key] = st.session_state[pending_key]
-            del st.session_state[pending_key]
 
     # --- メイン: 各レッグ入力 ---
     st.subheader("ポジション入力")
@@ -717,7 +788,9 @@ def main():
                 
                 # 初期化
                 if state_key not in st.session_state:
-                    st.session_state[state_key] = round_to_step(spot_center, strike_step)
+                    init_val = ceil_to_step(spot_center, strike_step)
+                    st.session_state[state_key] = init_val
+                    st.session_state[dial_key] = init_val
 
                 strike = st.number_input(
                     f"行使価格 K（刻み {strike_step:.0f} 円）",
@@ -799,18 +872,19 @@ def main():
             st.markdown(f"**レッグ {i}**  \n{color} {opt_type.upper()} {style}")
         
         with col_slider:
-            # ダイヤル専用のキーを使用
             dial_key = f"strike_dial_{i}"
             current_strike = st.session_state.get(state_key, spot_center)
-            
-            # on_changeコールバックで更新
+
             def update_strike_from_dial(leg_num=i):
                 dial_k = f"strike_dial_{leg_num}"
                 strike_k = f"strike_{leg_num}"
                 if dial_k in st.session_state:
-                    # 次回のレンダリング時に反映されるように別キーに保存
-                    st.session_state[f"_pending_strike_{leg_num}"] = st.session_state[dial_k]
-            
+                    raw_val = st.session_state[dial_k]
+                    rounded_val = ceil_to_step(raw_val, strike_step)
+                    # ダイヤル自体とレッグのKを両方更新
+                    st.session_state[dial_k] = rounded_val
+                    st.session_state[strike_k] = rounded_val
+
             st.slider(
                 f"ストライク調整 (現在: {current_strike:,.0f})",
                 min_value=dial_min,
@@ -823,14 +897,17 @@ def main():
                 on_change=update_strike_from_dial,
                 args=(i,)
             )
+
+
         
         with col_buttons:
             col_atm, col_otm_low, col_otm_high = st.columns(3)
-            
+
             def set_strike_value(leg_num, multiplier):
-                new_val = round_to_step(spot_center * multiplier, strike_step)
-                st.session_state[f"_pending_strike_{leg_num}"] = new_val
+                new_val = ceil_to_step(spot_center * multiplier, strike_step)
+                st.session_state[f"strike_{leg_num}"] = new_val
                 st.session_state[f"strike_dial_{leg_num}"] = new_val
+
             
             with col_atm:
                 st.button("ATM", key=f"atm_{i}", help="At The Money",

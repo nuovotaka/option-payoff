@@ -553,6 +553,11 @@ async def main(page: ft.Page):
         "prev_ticker": None,
         "prev_spot_center": None,
         "prev_preset": None,
+        # --- ここから What-if 用 ---
+        "what_if_enabled": True,
+        "what_if_price": 32000.0,
+        "what_if_days": 30,
+        "what_if_iv": 0.20,   # 20%
     }
 
     # UI要素の参照
@@ -621,6 +626,212 @@ async def main(page: ft.Page):
     strike_dials_container = ft.Column()  # ストライクダイヤル用
     chart_container = ft.Column()
     results_text = ft.Text("")
+
+    # What-if UI
+    what_if_enabled_check = ft.Checkbox(
+        label="What-if（時間・IV）シナリオを表示",
+        value=state["what_if_enabled"]
+    )
+
+    # 値表示用テキスト
+    what_if_price_value_text = ft.Text("", width=110)
+    what_if_days_value_text = ft.Text("", width=110)
+    what_if_iv_value_text = ft.Text("", width=110)
+
+    what_if_price_slider = ft.Slider(
+        min=0,
+        max=state["spot_center"] * 2,
+        value=state["spot_center"],
+        label="",           # ここは空でもOK（下でまとめて管理）
+        expand=True,
+    )
+
+    what_if_days_slider = ft.Slider(
+        min=0,
+        max=365,
+        value=state["what_if_days"],
+        label="",
+        expand=True,
+    )
+
+    what_if_iv_slider = ft.Slider(
+        min=0.01,
+        max=1.0,
+        value=state["what_if_iv"],
+        label="",
+        expand=True,
+    )
+
+    what_if_pl_text = ft.Text("", size=16, weight=ft.FontWeight.BOLD)
+
+
+    def update_what_if_value_labels():
+        # 価格はカンマ付き・0桁
+        price = state.get("what_if_price", state.get("spot_center", 0.0))
+        what_if_price_slider.label = "{value}"
+        what_if_price_value_text.value = f"{price:,.0f}"
+
+        # 日数は「◯日」
+        days = state.get("what_if_days", 0)
+        what_if_days_slider.label = "{value}"
+        what_if_days_value_text.value = f"{days} 日"
+
+        # IV はパーセント表示（例 0.25 → 25.0 %）
+        iv = state.get("what_if_iv", 0.2)
+        what_if_iv_slider.label = "{value:.2f}"
+        what_if_iv_value_text.value = f"{iv*100:.2f} %"
+
+
+    def reset_what_if_from_legs():
+        """
+        現在のレッグ設定から、what-if の初期値を「いい感じ」に決め直す。
+        - 価格: 現在の中心価格
+        - 日数: レッグの T_days の平均
+        - IV  : レッグの σ の平均
+        """
+        # 価格
+        base_price = state.get("spot_center", 0.0)
+
+        # 残存日数
+        t_list = [safe_int(leg.get("T_days", 30), 30) for leg in state["legs"].values()]
+        if t_list:
+            base_days = int(round(sum(t_list) / len(t_list)))
+        else:
+            base_days = 30
+
+        # インプライド・ボラティリティ
+        s_list = [safe_float(leg.get("sigma", 0.2), 0.2) for leg in state["legs"].values()]
+        if s_list:
+            base_iv = float(sum(s_list) / len(s_list))
+        else:
+            base_iv = 0.2
+
+        # 状態を更新
+        state["what_if_price"] = base_price
+        state["what_if_days"] = base_days
+        state["what_if_iv"] = base_iv
+
+        # スライダーにも反映
+        what_if_price_slider.min = state["spot_center"] - state["spot_range"]
+        what_if_price_slider.max = state["spot_center"] + state["spot_range"]
+        what_if_price_slider.value = base_price
+
+        what_if_days_slider.value = base_days
+        what_if_iv_slider.value = base_iv
+
+        update_what_if_label_texts()
+        update_what_if_value_labels() 
+
+    def update_what_if_label_texts():
+        what_if_price_slider.label = "{value}"
+        what_if_days_slider.label = "{value}日"
+        what_if_iv_slider.label = "{value:.2f}"
+
+    update_what_if_label_texts()
+
+    def on_what_if_enabled_change(e):
+        state["what_if_enabled"] = bool(e.control.value)
+        generate_chart()
+
+    def on_what_if_price_change(e):
+        val = safe_float(e.control.value, default=state["spot_center"])
+        state["what_if_price"] = val
+        update_what_if_value_labels()
+        generate_chart()
+
+    def on_what_if_days_change(e):
+        val = safe_int(e.control.value, default=state["what_if_days"])
+        state["what_if_days"] = max(0, val)
+        update_what_if_value_labels()
+        generate_chart()
+
+    def on_what_if_iv_change(e):
+        val = safe_float(e.control.value, default=state["what_if_iv"])
+        state["what_if_iv"] = max(0.01, min(val, 3.0))
+        update_what_if_value_labels()
+        generate_chart()
+
+    what_if_enabled_check.on_change = on_what_if_enabled_change
+    what_if_price_slider.on_change = on_what_if_price_change
+    what_if_days_slider.on_change = on_what_if_days_change
+    what_if_iv_slider.on_change = on_what_if_iv_change
+
+    def on_iv_crash(e):
+        # 各レッグの現在σの平均から 50% 減らす例
+        sigmas = [safe_float(leg.get("sigma", 0.2), 0.2) for leg in state["legs"].values()]
+        if sigmas:
+            avg_sigma = float(sum(sigmas) / len(sigmas))
+        else:
+            avg_sigma = 0.2
+        crashed = max(avg_sigma * 0.5, 0.01)
+        state["what_if_iv"] = crashed
+        what_if_iv_slider.value = crashed
+        update_what_if_label_texts()
+        update_what_if_value_labels()
+        generate_chart()
+
+    iv_crash_button = ft.OutlinedButton(
+        "IVクラッシュを再現",
+        icon=ft.Icons.FLASH_ON,
+        on_click=on_iv_crash,
+    )
+
+    def on_what_if_reset(e):
+        reset_what_if_from_legs()
+        generate_chart()
+
+    what_if_reset_button = ft.OutlinedButton(
+        "What-if をリセット",
+        icon=ft.Icons.RESTART_ALT,
+        on_click=on_what_if_reset,
+    )
+
+
+    what_if_card = ft.Card(
+        content=ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text("What-if：時間とボラティリティ", size=18, weight=ft.FontWeight.BOLD),
+                    what_if_enabled_check,
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                ft.Text("ドラッグして満期前（現時点）の損益カーブの変化を確認できます。", size=12),
+
+                # 価格
+                ft.Row([
+                    ft.Text("価格", width=80),
+                    what_if_price_slider,
+                    what_if_price_value_text,   # ← 現在値
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+
+                # 満期までの日数
+                ft.Row([
+                    ft.Text("満期までの日数", width=120),
+                    what_if_days_slider,
+                    what_if_days_value_text,
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+
+                # インプライド・ボラティリティ
+                ft.Row([
+                    ft.Text("インプライド・ボラティリティ", width=150),
+                    what_if_iv_slider,
+                    what_if_iv_value_text,
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+
+                ft.Row([
+                    iv_crash_button,
+                    what_if_reset_button,
+                    ft.Container(expand=True),
+                    ft.Text("予想損益: "),
+                    what_if_pl_text,
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            ]),
+            padding=15,
+        )
+    )
+
+
+    update_what_if_value_labels()
+
 
     # 横軸範囲コントロール用UI
     range_info_text = ft.Text(
@@ -847,6 +1058,18 @@ async def main(page: ft.Page):
         # 5. UI再構築 & レンジ表示更新 & グラフ再描画
         build_legs_ui()
         update_range_display()
+
+        # What-if スライダー範囲も更新
+        if "what_if_price" in state:
+            what_if_price_slider.min = spot_min = state["spot_center"] - state["spot_range"]
+            what_if_price_slider.max = spot_max = state["spot_center"] + state["spot_range"]
+            # 中心近辺に初期化
+            state["what_if_price"] = state["spot_center"]
+            what_if_price_slider.value = state["spot_center"]
+
+        # what-if を現在のレッグから再初期化
+        reset_what_if_from_legs()
+
         generate_chart()
 
     def on_preset_change(e=None):
@@ -1117,6 +1340,51 @@ async def main(page: ft.Page):
         total_now = total_pl_now_bs(positions, spots)
         total_maturity = total_payoff_maturity(positions, spots)
 
+        # --- What-if 用計算 ---
+        what_if_curve = None
+        what_if_pl_value = None
+        what_if_max = None
+        what_if_min = None
+
+        if state.get("what_if_enabled", False):
+            T_w = max(state["what_if_days"], 0) / 365.0
+            sigma_w = max(state["what_if_iv"], 0.01)
+
+            positions_w = []
+            for p in positions:
+                positions_w.append(
+                    OptionPosition(
+                        option_type=p.option_type,
+                        side=p.side,
+                        strike=p.strike,
+                        premium=p.premium,
+                        quantity=p.quantity,
+                        contract_size=p.contract_size,
+                        r=p.r,
+                        sigma=sigma_w,
+                        T=T_w,
+                    )
+                )
+            what_if_curve = total_pl_now_bs(positions_w, spots)
+
+            # What-if 価格スライダー位置での合計損益
+            S_w = state["what_if_price"]
+            S_w_clamped = max(spot_min, min(S_w, spot_max))
+            what_if_pl_value = float(
+                total_pl_now_bs(positions_w, np.array([S_w_clamped]))[0]
+            )
+
+            # What-if 曲線の最大・最小
+            what_if_max = float(np.max(what_if_curve))
+            what_if_min = float(np.min(what_if_curve))
+
+            # 予想損益テキスト更新
+            if what_if_pl_text is not None:
+                what_if_pl_text.value = f"{what_if_pl_value:,.0f} 円"
+        else:
+            if what_if_pl_text is not None:
+                what_if_pl_text.value = ""
+
         max_now = float(np.max(total_now))
         min_now = float(np.min(total_now))
         max_mat = float(np.max(total_maturity))
@@ -1136,6 +1404,22 @@ async def main(page: ft.Page):
         fig, ax = plt.subplots(figsize=(10, 5.5))
         ax.plot(spots, total_now, label='期中損益 (BS 理論価格)', color='#ff7f0e', linewidth=2.5)
         ax.plot(spots, total_maturity, label='満期損益', color='#1f77b4', linewidth=2, linestyle='--')
+
+        # --- What-if カーブを追加 ---
+        if what_if_curve is not None:
+            ax.plot(
+                spots,
+                what_if_curve,
+                label='What-if 期中損益',
+                color='#2ca02c',
+                linewidth=2,
+                linestyle='-.'
+            )
+            # What-if 価格位置に縦線マーカー
+            S_w = state["what_if_price"]
+            if spot_min <= S_w <= spot_max:
+                ax.axvline(x=S_w, color='#2ca02c', linewidth=1.0, linestyle=':', alpha=0.8)
+
         ax.axhline(y=0, color='gray', linewidth=1)
         ax.axvline(x=state["spot_center"], color='green', linewidth=1.2, linestyle=':', label=f'中心価格 ({state["spot_center"]:,.0f})')
 
@@ -1217,12 +1501,23 @@ async def main(page: ft.Page):
             ft.Image(src=img_bytes, width=800, height=440)
         )
 
-        results_text.value = (
+        base_text = (
             f"最大利益（期中）: {max_now:,.0f}\n"
             f"最大損失（期中）: {min_now:,.0f}\n"
             f"最大利益（満期）: {max_mat:,.0f}\n"
             f"最大損失（満期）: {min_mat:,.0f}"
         )
+
+        if what_if_curve is not None and what_if_max is not None and what_if_min is not None:
+            base_text += (
+                f"\n\n"
+                f"【What-if シナリオ】\n"
+                f"最大利益（期中）: {what_if_max:,.0f}\n"
+                f"最大損失（期中）: {what_if_min:,.0f}"
+            )
+
+        results_text.value = base_text
+
         update_range_display()
 
         page.update()
@@ -1308,6 +1603,7 @@ async def main(page: ft.Page):
                         icon=ft.Icons.REFRESH
                     ),
                     ft.Divider(),
+                    what_if_card,
                     range_control_card,
                     strike_dials_container,
                     chart_container,

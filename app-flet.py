@@ -76,9 +76,47 @@ def safe_int(val, default=1) -> int:
     return int(round(f))
 
 
+def normalize_ticker_for_yfinance(raw: str) -> str:
+    """
+    ユーザー入力を yfinance 用の正式ティッカーに正規化する。
+    例:
+      "7203"  -> "7203.T"
+      "7203.T" -> "7203.T"
+      "n225"  -> "^N225"
+      "topx" / "tpx" -> "^TOPX" （好みで変更可）
+    """
+    if not raw:
+        return raw
+
+    s = raw.strip()
+    u = s.upper()
+
+    # すでに ^ や .T などが付いていれば、そのまま使う
+    if u.startswith("^"):
+        return s
+    if u.endswith(".T"):
+        return s
+
+    # 日経225
+    if u in ("N225", "NI225", "NK225", "NKI"):
+        return "^N225"
+
+    # TOPIX
+    if u in ("TOPX", "TOPIX", "TPX"):
+        return "^TOPX"  # 必要に応じて他のコードに変更
+
+    # 数字だけなら日本株コードとみなして .T を付ける
+    if u.isdigit():
+        return f"{u}.T"
+
+    # デフォルトはそのまま返す
+    return s
+
+
 def get_last_close(ticker: str) -> float | None:
     try:
-        data = yf.Ticker(ticker).history(period="5d")
+        norm = normalize_ticker_for_yfinance(ticker)
+        data = yf.Ticker(norm).history(period="5d")
         if data.empty:
             return None
         return float(data["Close"].iloc[-1])
@@ -110,6 +148,12 @@ def round_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return round(x / step) * step
+
+
+def round_to_step_ceiling(x: float, step: float) -> float:
+    if step <= 0:
+        return x
+    return math.ceil(x / step) * step
 
 
 def bs_price(
@@ -248,6 +292,8 @@ class StrategyPreset(str, Enum):
     BEAR_PUT_SPREAD = "ベア・プット・スプレッド（緩やかな弱気）"
     BULL_PUT_SPREAD = "ブル・プット・スプレッド（クレジット・強気〜横ばい）"
     BEAR_CALL_SPREAD = "ベア・コール・スプレッド（クレジット・弱気〜横ばい）"
+    ATM_BULL_PUT_CREDIT_SPREAD = "ATM ブル・プット・クレジット・スプレッド"
+    ATM_BEAR_CALL_CREDIT_SPREAD = "ATM ベア・コール・クレジット・スプレッド"
     LONG_STRADDLE = "ロング・ストラドル（変動大きめ予想）"
     SHORT_STRADDLE = "ショート・ストラドル（変動小さめ予想・高リスク）"
     LONG_STRANGLE = "ロング・ストラングル（大化け・急変狙い、低コスト）"
@@ -294,7 +340,9 @@ def build_positions_from_preset(
     T_long = 90 / 365
 
     step = guess_strike_step_from_ticker(ticker)
-    k_atm = round_to_step(spot_center, step)
+    k_atm = round_to_step_ceiling(spot_center, step)
+    k_down1 = k_atm - step
+    k_up1 = k_atm + step
     k_low = round_to_step(spot_center * 0.95, step)
     k_high = round_to_step(spot_center * 1.05, step)
     k_very_low = round_to_step(spot_center * 0.9, step)
@@ -343,6 +391,24 @@ def build_positions_from_preset(
         )
         positions.append(
             OptionPosition("call", "long", k_high, 200.0, 1, contract_size, r, sigma, T_short)
+        )
+    elif preset == StrategyPreset.ATM_BULL_PUT_CREDIT_SPREAD:
+        # atm ブル・プット・クレジット・スプレッド
+        # 現在価格付近(ATM)のプットを売り、その1ストライク下のプットを買う
+        positions.append(
+            OptionPosition("put", "short", k_atm, 260.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("put", "long", k_down1, 140.0, 1, contract_size, r, sigma, T_short)
+        )
+    elif preset == StrategyPreset.ATM_BEAR_CALL_CREDIT_SPREAD:
+        # atm ベア・コール・クレジット・スプレッド
+        # 現在価格付近(ATM)のコールを売り、その1ストライク上のコールを買う
+        positions.append(
+            OptionPosition("call", "short", k_atm, 260.0, 1, contract_size, r, sigma, T_short)
+        )
+        positions.append(
+            OptionPosition("call", "long", k_up1, 140.0, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.LONG_STRADDLE:
         positions.append(
@@ -689,7 +755,10 @@ async def main(page: ft.Page):
             pass
 
     def update_ticker_info(e=None, force_k_update=True):
-        state["ticker"] = ticker_field.value or "^N225"
+        raw = ticker_field.value or "^N225"
+        norm = normalize_ticker_for_yfinance(raw)
+        
+        state["ticker"] = norm
         old_center = state.get("spot_center", 32000.0)
 
         # 1. yfinance から中心価格を取得

@@ -563,6 +563,13 @@ def main():
         st.session_state["spot_range"] = 4000.0
     if "auto_range_enabled" not in st.session_state:
         st.session_state["auto_range_enabled"] = False
+    # What-if用（初期値は後でspot_centerに合わせて設定）
+    if "what_if_days" not in st.session_state:
+        st.session_state["what_if_days"] = 30
+    if "what_if_iv" not in st.session_state:
+        st.session_state["what_if_iv"] = 0.20
+    if "what_if_enabled" not in st.session_state:
+        st.session_state["what_if_enabled"] = True
 
     # --- サイドバー: 原資産 & レンジ設定 ---
     st.sidebar.header("原資産レンジ設定")
@@ -641,6 +648,15 @@ def main():
     spot_min = spot_center - spot_range
     spot_max = spot_center + spot_range
     spots = np.arange(spot_min, spot_max + spot_step, spot_step)
+
+    # what_if_priceを spot_center に合わせて初期化（spot_centerが変わったら更新）
+    if "what_if_price" not in st.session_state or "prev_spot_center_for_what_if" not in st.session_state:
+        st.session_state["what_if_price"] = spot_center
+        st.session_state["prev_spot_center_for_what_if"] = spot_center
+    elif st.session_state.get("prev_spot_center_for_what_if") != spot_center:
+        # spot_centerが変わった場合、what_if_priceも更新
+        st.session_state["what_if_price"] = spot_center
+        st.session_state["prev_spot_center_for_what_if"] = spot_center
 
     # --- サイドバー: 共通パラメータ ---
     st.sidebar.header("共通パラメータ")
@@ -733,6 +749,29 @@ def main():
 
             # ダイヤルも同じ値にそろえる
             st.session_state[f"strike_dial_{i}"] = base.strike
+        
+        # プリセット変更時にwhat-ifも新しいレッグに合わせて初期化
+        # 価格は中心価格に
+        st.session_state["what_if_price"] = spot_center
+        
+        # 日数はレッグの平均に
+        t_list = [int(base.T * 365) for base in preset_dict.values()]
+        if t_list:
+            avg_days = int(round(sum(t_list) / len(t_list)))
+        else:
+            avg_days = 30
+        st.session_state["what_if_days"] = avg_days
+        
+        # IVはレッグの平均に
+        s_list = [base.sigma for base in preset_dict.values()]
+        if s_list:
+            avg_iv = float(sum(s_list) / len(s_list))
+        else:
+            avg_iv = 0.2
+        st.session_state["what_if_iv"] = avg_iv
+        
+        # session_stateを更新後、再描画が必要
+        # （次の描画サイクルで新しい値がスライダーに反映される）
 
     positions: List[OptionPosition] = []
 
@@ -921,12 +960,153 @@ def main():
 
     st.markdown("---")
 
-    # --- グラフ描画 ---
-    if st.button("グラフを更新", type="primary"):
-        if not positions:
-            st.warning("少なくとも 1 つポジションを入力してください。")
-            return
+    # --- What-if シナリオ設定 ---
+    st.subheader("What-if：時間とボラティリティシナリオ")
+    
+    what_if_enabled = st.checkbox(
+        "What-if（時間・IV）シナリオを表示",
+        value=st.session_state["what_if_enabled"],
+        key="what_if_enabled_check"
+    )
+    st.session_state["what_if_enabled"] = what_if_enabled
+    
+    if what_if_enabled:
+        st.caption("満期前（現時点）の損益カーブの変化を確認できます")
+        
+        # 価格スライダーの範囲
+        price_min = spot_center - spot_range
+        price_max = spot_center + spot_range
+        
+        # 現在のwhat_if_priceが範囲外の場合はspot_centerに戻す
+        current_what_if_price = st.session_state.get("what_if_price", spot_center)
+        if current_what_if_price < price_min or current_what_if_price > price_max:
+            current_what_if_price = spot_center
+            st.session_state["what_if_price"] = spot_center
+        
+        # ボタンのコールバック関数（スライダーより前に定義）
+        def on_iv_crash():
+            # positionsがまだ構築されていない可能性があるので、既存のIVを使う
+            if positions:
+                sigmas = [p.sigma for p in positions]
+                if sigmas:
+                    avg_sigma = float(sum(sigmas) / len(sigmas))
+                else:
+                    avg_sigma = 0.2
+            else:
+                avg_sigma = st.session_state.get("what_if_iv", 0.2)
+            crashed = max(avg_sigma * 0.5, 0.01)
+            st.session_state["what_if_iv"] = crashed
+        
+        def on_what_if_reset():
+            # 価格を中心価格に
+            st.session_state["what_if_price"] = spot_center
+            
+            # positionsがある場合はその平均値、なければデフォルト値
+            if positions:
+                # 日数をレッグの平均に
+                t_list = [int(p.T * 365) for p in positions]
+                if t_list:
+                    avg_days = int(round(sum(t_list) / len(t_list)))
+                else:
+                    avg_days = 30
+                st.session_state["what_if_days"] = avg_days
+                
+                # IVをレッグの平均に
+                s_list = [p.sigma for p in positions]
+                if s_list:
+                    avg_iv = float(sum(s_list) / len(s_list))
+                else:
+                    avg_iv = 0.2
+                st.session_state["what_if_iv"] = avg_iv
+            else:
+                st.session_state["what_if_days"] = 30
+                st.session_state["what_if_iv"] = 0.2
+        
+        # 価格スライダー（keyを使ってsession_stateと直接連携）
+        st.slider(
+            "What-if 価格",
+            min_value=price_min,
+            max_value=price_max,
+            value=float(current_what_if_price),
+            step=spot_step,
+            format="%.0f",
+            key="what_if_price"
+        )
+        st.caption(f"現在価格: {st.session_state['what_if_price']:,.0f}")
+        
+        # 満期までの日数スライダー
+        current_what_if_days = int(st.session_state.get("what_if_days", 30))
+        st.slider(
+            "満期までの日数",
+            min_value=0,
+            max_value=365,
+            value=current_what_if_days,
+            step=1,
+            key="what_if_days"
+        )
+        st.caption(f"{st.session_state['what_if_days']} 日")
+        
+        # インプライド・ボラティリティスライダー
+        current_what_if_iv = float(st.session_state.get("what_if_iv", 0.2))
+        st.slider(
+            "インプライド・ボラティリティ",
+            min_value=0.01,
+            max_value=1.0,
+            value=current_what_if_iv,
+            step=0.01,
+            format="%.2f",
+            key="what_if_iv"
+        )
+        st.caption(f"{st.session_state['what_if_iv']*100:.2f} %")
+        
+        # IVクラッシュボタンとリセットボタン
+        col_crash, col_reset = st.columns(2)
+        with col_crash:
+            st.button(
+                "⚡ IVクラッシュを再現", 
+                help="現在のIVの50%に減少", 
+                key="iv_crash_btn",
+                on_click=on_iv_crash
+            )
+        
+        with col_reset:
+            st.button(
+                "🔄 What-if をリセット", 
+                help="レッグの平均値にリセット", 
+                key="what_if_reset_btn",
+                on_click=on_what_if_reset
+            )
+        
+        # What-if損益を計算
+        what_if_pl = 0.0
+        what_if_price_for_calc = st.session_state.get("what_if_price", spot_center)
+        what_if_days_for_calc = st.session_state.get("what_if_days", 30)
+        what_if_iv_for_calc = st.session_state.get("what_if_iv", 0.2)
+        
+        if positions:
+            # 各レッグのWhat-if時点での損益を計算
+            for pos in positions:
+                # What-ifパラメータで新しいポジションを作成
+                what_if_pos = OptionPosition(
+                    option_type=pos.option_type,
+                    side=pos.side,
+                    strike=pos.strike,
+                    premium=pos.premium,
+                    quantity=pos.quantity,
+                    contract_size=pos.contract_size,
+                    r=pos.r,
+                    sigma=what_if_iv_for_calc,
+                    T=what_if_days_for_calc / 365.0
+                )
+                what_if_pl += what_if_pos.pl_now_bs(np.array([what_if_price_for_calc]))[0]
+        
+        st.markdown(f"**予想損益: {what_if_pl:,.0f} 円**")
+    
+    st.markdown("---")
 
+    # --- グラフ描画 ---
+    # ポジションがあれば常に描画（ボタンは不要）
+    if positions:
         # 自動範囲調整が有効な場合
         if st.session_state.get("auto_range_enabled", False):
             strikes = [p.strike for p in positions]
@@ -971,6 +1151,54 @@ def main():
             )
         )
 
+        # What-if曲線を追加
+        if st.session_state.get("what_if_enabled", False):
+            what_if_iv = st.session_state.get("what_if_iv", 0.2)
+            what_if_days = st.session_state.get("what_if_days", 30)
+            what_if_T = what_if_days / 365.0
+
+            # What-ifパラメータでポジションを再作成して損益を計算
+            what_if_positions = []
+            for pos in positions:
+                what_if_pos = OptionPosition(
+                    option_type=pos.option_type,
+                    side=pos.side,
+                    strike=pos.strike,
+                    premium=pos.premium,
+                    quantity=pos.quantity,
+                    contract_size=pos.contract_size,
+                    r=pos.r,
+                    sigma=what_if_iv,
+                    T=what_if_T
+                )
+                what_if_positions.append(what_if_pos)
+
+            total_what_if = total_pl_now_bs(what_if_positions, spots)
+
+            fig.add_trace(
+                go.Scatter(
+                    x=spots,
+                    y=total_what_if,
+                    mode="lines",
+                    name=f"What-if (T={what_if_days}d, IV={what_if_iv*100:.0f}%)",
+                    line=dict(color="purple", width=2, dash="dot")
+                )
+            )
+
+            # What-if価格の位置にマーカーを追加
+            what_if_price = st.session_state.get("what_if_price", spot_center)
+            what_if_pl_at_price = np.interp(what_if_price, spots, total_what_if)
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[what_if_price],
+                    y=[what_if_pl_at_price],
+                    mode="markers",
+                    name="What-if Point",
+                    marker=dict(color="purple", size=10, symbol="star")
+                )
+            )
+
         fig.add_hline(y=0, line_color="gray", line_width=1)
         fig.add_vline(x=spot_center, line_color="green", line_width=1, line_dash="dot")
 
@@ -982,7 +1210,7 @@ def main():
                 label_text += "売"
             else:
                 label_text += "買"
-            
+
             fig.add_vline(
                 x=pos.strike,
                 line_color=textcolor if pos.side == "long" else bgcolor,
@@ -990,7 +1218,7 @@ def main():
                 line_dash="dot",
                 opacity=0.5
             )
-            
+
             # ストライクラベルをアノテーションで追加
             fig.add_annotation(
                 x=pos.strike,
@@ -1062,9 +1290,13 @@ def main():
 
         st.caption(
             "🟠 オレンジ実線: 期中（BS 理論価格） / "
-            "🔵 青破線: 満期損益 / 🟢 緑点線: 中心価格 / "
+            "🔵 青破線: 満期損益 / "
+            "🟣 紫点線: What-ifシナリオ / "
+            "🟢 緑点線: 中心価格 / "
             "⚪ 点線: ストライク価格"
         )
+    else:
+        st.info("レッグを設定してください。戦略プリセットを選択すると自動的にレッグが設定されます。")
 
 
 if __name__ == "__main__":

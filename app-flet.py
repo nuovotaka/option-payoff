@@ -105,6 +105,28 @@ def normalize_ticker_for_yfinance(raw: str) -> str:
     if u in ("TOPX", "TOPIX", "TPX"):
         return "^TOPX"  # 必要に応じて他のコードに変更
 
+    # --- ここから米インデックス関連 ---
+    # S&P500 index (SPX), S&P500 index mini (XSP)
+    # XSPはSPXの1/10スケールなので、同じ^GSPCを参照
+    if u in ("SPX", "SPX INDEX", "INX", "SP500"):
+        return "^GSPC"
+    
+    # XSP (Mini-SPX) - SPXと同じ指数を参照するが、別ティッカーとして認識
+    if u == "XSP":
+        return "^GSPC"
+
+    # NASDAQ100
+    if u in ("NDX", "NASDAQ100"):
+        return "^NDX"
+
+    # Russell 2000
+    if u in ("RUT", "RUSSELL2000"):
+        return "^RUT"
+
+    # VIX
+    if u in ("VIX", "VIX INDEX"):
+        return "^VIX"
+
     # 数字だけなら日本株コードとみなして .T を付ける
     if u.isdigit():
         return f"{u}.T"
@@ -125,22 +147,64 @@ def get_last_close(ticker: str) -> float | None:
 
 
 def guess_contract_size_from_ticker(ticker: str) -> int:
-    t = ticker.upper()
+    # 正規化してから判定
+    norm = normalize_ticker_for_yfinance(ticker)
+    t = norm.upper()
+    
     if "N225" in t:
         if "MICRO" in t:
             return 10
         if "MINI" in t:
             return 100
         return 1000
+
+    # XSP (Mini-SPX) は100（SPXの1/10スケール）
+    if "XSP" in ticker.upper():  # 元の入力をチェック（正規化前）
+        return 100
+    
+    # SPX / NDX / RUT など米インデックス
+    if any(x in t for x in ("SPX", "^GSPC", "^NDX", "NDX", "^RUT", "RUT")):
+        return 100
+
+    # ETF / 米個別株
+    if not t.endswith(".T"):
+        return 100
+
     return 100
 
 
-def guess_strike_step_from_ticker(ticker: str) -> float:
-    t = ticker.upper()
-    if "TOPIX" in t or "TPX" in t:
+def guess_strike_step_from_ticker(ticker: str, price: float = None) -> float:
+    # 正規化してから判定（ただしXSPは元の入力もチェック）
+    norm = normalize_ticker_for_yfinance(ticker)
+    t = norm.upper()
+    orig_t = ticker.upper()
+
+    # --- 日本指数 ---
+    if "TOPIX" in t or "TPX" in t or "^TOPX" in t:
         return 25.0
-    if "N225" in t:
+    if "N225" in t or "^N225" in t:
         return 125.0
+
+    # --- 米国指数（SPX/XSP/NDX/RUT など） ---
+    # XSP (Mini-SPX) - 0.5刻み（元の入力をチェック）
+    if "XSP" in orig_t:
+        return 0.5
+    
+    # SPX / ^GSPC
+    if any(x in t for x in ("SPX", "^GSPC")):
+        return 5.0  # SPXは通常5ドル刻み
+
+    # NDX, RUT
+    if any(x in t for x in ("^NDX", "NDX", "^RUT", "RUT")):
+        return 5.0
+
+    # --- ETF・米個別株（SPY, QQQ, AAPL など） ---
+    if not t.endswith(".T"):
+        # .T がついていないものを「海外銘柄」とみなして 1 ドル刻み
+        return 1.0
+
+    # --- 日本個別株 (.T) - オプションのストライク刻みは100円が標準 ---
+    # ※現物株の呼値とオプションのストライク刻みは異なる
     return 100.0
 
 
@@ -339,7 +403,7 @@ def build_positions_from_preset(
     T_short = 30 / 365
     T_long = 90 / 365
 
-    step = guess_strike_step_from_ticker(ticker)
+    step = guess_strike_step_from_ticker(ticker, spot_center)
     k_atm = round_to_step_ceiling(spot_center, step)
     k_down1 = k_atm - step
     k_up1 = k_atm + step
@@ -541,6 +605,8 @@ async def main(page: ft.Page):
 
     # 状態管理
     state = {
+        "ticker_input": "^N225",   # ユーザーが入力したそのまま
+        "ticker_yf": "^N225",      # yfinance に投げる用
         "ticker": "^N225",
         "spot_center": 32000.0,
         "spot_range": 4000.0,
@@ -966,20 +1032,39 @@ async def main(page: ft.Page):
             pass
 
     def update_ticker_info(e=None, force_k_update=True):
+        # ユーザー入力そのまま
         raw = ticker_field.value or "^N225"
+        state["ticker_input"] = raw
+        u_raw = raw.strip().upper()
+
+        # yfinance 用に正規化
         norm = normalize_ticker_for_yfinance(raw)
-        
+        state["ticker_yf"] = norm
         state["ticker"] = norm
+
         old_center = state.get("spot_center", 32000.0)
 
         # 1. yfinance から中心価格を取得
         if auto_fetch_check.value:
-            last_close = get_last_close(state["ticker"])
+            last_close = get_last_close(state["ticker_yf"])
             if last_close is not None:
-                new_center = float(round(last_close, -1) if last_close > 1000 else round(last_close, 1))
+                # ★ XSP のときだけ 1/10 に換算して使う
+                if u_raw == "XSP":
+                    last_close_xsp = last_close / 10.0
+                    new_center = float(round(last_close_xsp, 1))
+                    yfinance_info.value = (
+                        f"SPX 終値: 約 {last_close:,.2f} → "
+                        f"XSP換算: 約 {last_close_xsp:,.2f}"
+                    )
+                else:
+                    last_close_xsp = None  # 使わないが一応
+                    new_center = float(
+                        round(last_close, -1) if last_close > 1000 else round(last_close, 1)
+                    )
+                    yfinance_info.value = f"yfinance 終値: 約 {last_close:,.2f}"
+
                 state["spot_center"] = new_center
                 spot_center_field.value = str(state["spot_center"])
-                yfinance_info.value = f"yfinance 終値: 約 {last_close:,.2f}"
             else:
                 yfinance_info.value = "価格を取得できませんでした"
         else:
@@ -991,10 +1076,11 @@ async def main(page: ft.Page):
         center = state["spot_center"]
 
         # 2. 取引単位 & 刻み幅の推定
-        state["contract_size"] = guess_contract_size_from_ticker(state["ticker"])
+        #    （XSP と ^GSPC を区別するため）
+        state["contract_size"] = guess_contract_size_from_ticker(state["ticker_input"])
         contract_size_field.value = str(state["contract_size"])
 
-        strike_step = guess_strike_step_from_ticker(state["ticker"])
+        strike_step = guess_strike_step_from_ticker(state["ticker_input"], state["spot_center"])
         state["spot_step"] = strike_step
         spot_step_field.value = str(strike_step)
 
@@ -1136,11 +1222,11 @@ async def main(page: ft.Page):
         
         for i in range(1, state["n_legs"] + 1):
             if i not in state["legs"]:
-                strike_step = guess_strike_step_from_ticker(state["ticker"])
+                strike_step = guess_strike_step_from_ticker(state["ticker"], state["spot_center"])
                 state["legs"][i] = {
                     "type": "call",
                     "side": "long",
-                    "strike": round_to_step(state["spot_center"], strike_step),
+                    "strike": round_to_step_ceiling(state["spot_center"], strike_step),
                     "premium": 300.0,
                     "quantity": 1,
                     "sigma": 0.2,
@@ -1255,7 +1341,7 @@ async def main(page: ft.Page):
 
         spot_min = state["spot_center"] - state["spot_range"]
         spot_max = state["spot_center"] + state["spot_range"]
-        step = guess_strike_step_from_ticker(state["ticker"])
+        step = guess_strike_step_from_ticker(state["ticker"], state["spot_center"])
 
         for i in range(1, state["n_legs"] + 1):
             if i not in state["legs"]:

@@ -135,6 +135,54 @@ def normalize_ticker_for_yfinance(raw: str) -> str:
     return s
 
 
+def is_us_ticker(ticker: str) -> bool:
+    """
+    ティッカーが米国銘柄（ドル建て）かどうかを判定する。
+    """
+    if not ticker:
+        return False
+    
+    u = ticker.upper().strip()
+    
+    # 日本株や日本の指数は円建て
+    if u.endswith(".T") or "N225" in u or "TOPIX" in u or "TPX" in u:
+        return False
+    
+    # 日本の株式コード（4桁の数字のみ）は円建て
+    if u.isdigit() and len(u) == 4:
+        return False
+    
+    # 米国指数
+    if any(x in u for x in ["^GSPC", "^NDX", "^RUT", "SPX", "XSP", "NDX", "RUT", "VIX", "^VIX"]):
+        return True
+    
+    # その他（米国個別株やETF）はドル建てと判定
+    # 注：これは簡易的な判定。より正確には取引所情報が必要
+    return True
+
+
+def get_currency_symbol(ticker: str) -> str:
+    """
+    ティッカーに対応する通貨記号を返す。
+    """
+    return "$" if is_us_ticker(ticker) else "円"
+
+
+def format_currency(value: float, ticker: str) -> str:
+    """
+    値を通貨フォーマットで表示する。
+    ドル: $1,000 または -$1,000
+    円: 1,000円 または -1,000円
+    """
+    if is_us_ticker(ticker):
+        if value < 0:
+            return f"-${abs(value):,.0f}"
+        else:
+            return f"${value:,.0f}"
+    else:
+        return f"{value:,.0f}円"
+
+
 def get_last_close(ticker: str) -> float | None:
     try:
         norm = normalize_ticker_for_yfinance(ticker)
@@ -412,181 +460,202 @@ def build_positions_from_preset(
     k_very_low = round_to_step(spot_center * 0.9, step)
     k_very_high = round_to_step(spot_center * 1.1, step)
 
+    # プレミアム価格のスケーリング（原資産価格に比例）
+    # 日本株（N225=32000円前後）を基準として、300円のプレミアムを使用
+    # 米国株（SPX=6000ドル, XSP=600ドル）は適切にスケーリング
+    base_price = 32000.0  # 日本株基準価格
+    base_premium_atm = 300.0  # ATMオプションの基準プレミアム
+    scale = spot_center / base_price
+    
+    # スケーリングしたプレミアム価格
+    p_atm = round(base_premium_atm * scale, 1)
+    p_high = round(p_atm * 1.33, 1)  # 400 相当
+    p_mid = round(p_atm * 0.87, 1)   # 260 相当
+    p_low = round(p_atm * 0.67, 1)   # 200 相当
+    p_vlow = round(p_atm * 0.6, 1)   # 180 相当
+    p_xlow = round(p_atm * 0.47, 1)  # 140 相当
+    p_vhigh = round(p_atm * 1.17, 1) # 350 相当
+    p_xhigh = round(p_atm * 0.83, 1) # 250 相当
+    p_med = round(p_atm * 0.73, 1)   # 220 相当
+    p_sml = round(p_atm * 0.5, 1)    # 150 相当
+    p_xsml = round(p_atm * 0.4, 1)   # 120 相当
+    p_xxhigh = round(p_atm * 0.8, 1) # 240 相当
+
     if preset == StrategyPreset.LONG_CALL:
         positions.append(
-            OptionPosition("call", "long", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.SHORT_CALL:
         positions.append(
-            OptionPosition("call", "short", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.LONG_PUT:
         positions.append(
-            OptionPosition("put", "long", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.SHORT_PUT:
         positions.append(
-            OptionPosition("put", "short", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.BULL_CALL_SPREAD:
         positions.append(
-            OptionPosition("call", "long", k_low, 400.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_low, p_high, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "short", k_high, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_high, p_low, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.BEAR_PUT_SPREAD:
         positions.append(
-            OptionPosition("put", "long", k_high, 400.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_high, p_high, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "short", k_low, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_low, p_low, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.BULL_PUT_SPREAD:
         positions.append(
-            OptionPosition("put", "short", k_high, 400.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_high, p_high, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "long", k_low, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_low, p_low, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.BEAR_CALL_SPREAD:
         positions.append(
-            OptionPosition("call", "short", k_low, 400.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_low, p_high, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "long", k_high, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_high, p_low, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.ATM_BULL_PUT_CREDIT_SPREAD:
         # atm ブル・プット・クレジット・スプレッド
         # 現在価格付近(ATM)のプットを売り、その1ストライク下のプットを買う
         positions.append(
-            OptionPosition("put", "short", k_atm, 260.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_atm, p_mid, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "long", k_down1, 140.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_down1, p_xlow, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.ATM_BEAR_CALL_CREDIT_SPREAD:
         # atm ベア・コール・クレジット・スプレッド
         # 現在価格付近(ATM)のコールを売り、その1ストライク上のコールを買う
         positions.append(
-            OptionPosition("call", "short", k_atm, 260.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_atm, p_mid, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "long", k_up1, 140.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_up1, p_xlow, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.LONG_STRADDLE:
         positions.append(
-            OptionPosition("call", "long", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "long", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.SHORT_STRADDLE:
         positions.append(
-            OptionPosition("call", "short", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "short", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.LONG_STRANGLE:
         positions.append(
-            OptionPosition("call", "long", k_high, 180.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_high, p_vlow, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "long", k_low, 180.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_low, p_vlow, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.SHORT_STRANGLE:
         positions.append(
-            OptionPosition("call", "short", k_high, 250.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_high, p_xhigh, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "short", k_low, 250.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_low, p_xhigh, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.IRON_CONDOR:
         positions.append(
-            OptionPosition("put", "short", k_low, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_low, p_low, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "long", k_very_low, 100.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_very_low, round(p_low * 0.5, 1), 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "short", k_high, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_high, p_low, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "long", k_very_high, 100.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_very_high, round(p_low * 0.5, 1), 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.IRON_BUTTERFLY:
         positions.append(
-            OptionPosition("call", "short", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "short", k_atm, 300.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_atm, p_atm, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "long", k_high, 150.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_high, p_sml, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "long", k_low, 150.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_low, p_sml, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.COVERED_CALL:
         positions.append(
-            OptionPosition("call", "short", k_high, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_high, p_low, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.PROTECTIVE_PUT:
         positions.append(
-            OptionPosition("put", "long", k_low, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_low, p_low, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.COLLAR:
         positions.append(
-            OptionPosition("put", "long", k_low, 150.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_low, p_sml, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "short", k_high, 150.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_high, p_sml, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.CASH_SECURED_PUT:
         positions.append(
-            OptionPosition("put", "short", k_low, 250.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_low, p_xhigh, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.PUT_RATIO_SPREAD:
         positions.append(
-            OptionPosition("put", "long", k_high, 350.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_high, p_vhigh, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "short", k_low, 220.0, 2, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_low, p_med, 2, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.CALENDAR_SPREAD:
         positions.append(
-            OptionPosition("call", "short", k_atm, 200.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_atm, p_low, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "long", k_atm, 250.0, 1, contract_size, r, sigma, T_long)
+            OptionPosition("call", "long", k_atm, p_xhigh, 1, contract_size, r, sigma, T_long)
         )
     elif preset == StrategyPreset.JADE_LIZARD:
         # シンプルなジェイド・リザード：
         # プット売り（k_low）＋ショート・コール・スプレッド（k_high〜k_very_high）
         positions.append(
-            OptionPosition("put", "short", k_low, 260.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_low, p_mid, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "short", k_high, 220.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_high, p_med, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "long", k_very_high, 120.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_very_high, p_xsml, 1, contract_size, r, sigma, T_short)
         )
     elif preset == StrategyPreset.SAFE_JADE_LIZARD:
         # 安全版ジェイド・リザード：
         # ジェイド・リザード＋遠いプット買いで下もスプレッド化（両サイド損失限定）
         positions.append(
-            OptionPosition("put", "short", k_low, 240.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "short", k_low, p_xxhigh, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("put", "long", k_very_low, 120.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("put", "long", k_very_low, p_xsml, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "short", k_high, 220.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "short", k_high, p_med, 1, contract_size, r, sigma, T_short)
         )
         positions.append(
-            OptionPosition("call", "long", k_very_high, 120.0, 1, contract_size, r, sigma, T_short)
+            OptionPosition("call", "long", k_very_high, p_xsml, 1, contract_size, r, sigma, T_short)
         )
 
     return positions
@@ -1466,7 +1535,7 @@ async def main(page: ft.Page):
 
             # 予想損益テキスト更新
             if what_if_pl_text is not None:
-                what_if_pl_text.value = f"{what_if_pl_value:,.0f} 円"
+                what_if_pl_text.value = format_currency(what_if_pl_value, state["ticker"])
         else:
             if what_if_pl_text is not None:
                 what_if_pl_text.value = ""
@@ -1569,8 +1638,11 @@ async def main(page: ft.Page):
         ax.tick_params(axis='x', rotation=15, labelsize=9)
         ax.tick_params(axis='y', labelsize=9)
 
+        # 通貨記号を取得
+        currency = get_currency_symbol(state["ticker"])
+        
         ax.set_xlabel('原資産価格 S', fontsize=11)
-        ax.set_ylabel('損益 (円)', fontsize=11)
+        ax.set_ylabel(f'損益 ({currency})', fontsize=11)
         ax.set_title(f'オプション戦略 損益グラフ（原資産: {state["ticker"]}）', fontsize=13, weight='bold')
         ax.legend(loc='best', framealpha=0.85)
         ax.grid(True, alpha=0.3, linestyle='--')
@@ -1587,19 +1659,22 @@ async def main(page: ft.Page):
             ft.Image(src=img_bytes, width=800, height=440)
         )
 
+        # 通貨フォーマット用のティッカー取得
+        current_ticker = state["ticker"]
+        
         base_text = (
-            f"最大利益（期中）: {max_now:,.0f}\n"
-            f"最大損失（期中）: {min_now:,.0f}\n"
-            f"最大利益（満期）: {max_mat:,.0f}\n"
-            f"最大損失（満期）: {min_mat:,.0f}"
+            f"最大利益（期中）: {format_currency(max_now, current_ticker)}\n"
+            f"最大損失（期中）: {format_currency(min_now, current_ticker)}\n"
+            f"最大利益（満期）: {format_currency(max_mat, current_ticker)}\n"
+            f"最大損失（満期）: {format_currency(min_mat, current_ticker)}"
         )
 
         if what_if_curve is not None and what_if_max is not None and what_if_min is not None:
             base_text += (
                 f"\n\n"
                 f"【What-if シナリオ】\n"
-                f"最大利益（期中）: {what_if_max:,.0f}\n"
-                f"最大損失（期中）: {what_if_min:,.0f}"
+                f"最大利益（期中）: {format_currency(what_if_max, current_ticker)}\n"
+                f"最大損失（期中）: {format_currency(what_if_min, current_ticker)}"
             )
 
         results_text.value = base_text

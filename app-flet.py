@@ -1008,7 +1008,9 @@ async def main(page: ft.Page):
                 except (ValueError, TypeError):
                     pass
         center = state["spot_center"]
-        strike_step = guess_strike_step_from_ticker(state["ticker"])
+        # 元のユーザー入力を使用
+        ticker_for_step = state.get("ticker_input", state["ticker"])
+        strike_step = guess_strike_step_from_ticker(ticker_for_step)
         if strikes:
             max_dist = max([abs(k - center) for k in strikes] + [strike_step * 2])
             auto_range = float(round_to_step(max_dist * 1.5, strike_step))
@@ -1033,7 +1035,9 @@ async def main(page: ft.Page):
     def set_quick_range_percent(pct: float):
         update_state_from_fields()
         center = state["spot_center"]
-        strike_step = guess_strike_step_from_ticker(state["ticker"])
+        # 元のユーザー入力を使用
+        ticker_for_step = state.get("ticker_input", state["ticker"])
+        strike_step = guess_strike_step_from_ticker(ticker_for_step)
         val = float(round_to_step(center * (pct / 100.0), strike_step))
         val = max(val, strike_step * 2)
         set_quick_range(val)
@@ -1078,7 +1082,13 @@ async def main(page: ft.Page):
     )
 
     def update_state_from_fields():
-        state["ticker"] = ticker_field.value or "^N225"
+        # ティッカーは正規化して保存（update_ticker_info と同じロジック）
+        raw = ticker_field.value or "^N225"
+        state["ticker_input"] = raw
+        norm = normalize_ticker_for_yfinance(raw)
+        state["ticker_yf"] = norm
+        state["ticker"] = norm
+        
         try:
             state["spot_center"] = float(spot_center_field.value)
         except (ValueError, TypeError):
@@ -1291,7 +1301,9 @@ async def main(page: ft.Page):
         
         for i in range(1, state["n_legs"] + 1):
             if i not in state["legs"]:
-                strike_step = guess_strike_step_from_ticker(state["ticker"], state["spot_center"])
+                # 元のユーザー入力を使用
+                ticker_for_step = state.get("ticker_input", state["ticker"])
+                strike_step = guess_strike_step_from_ticker(ticker_for_step, state["spot_center"])
                 state["legs"][i] = {
                     "type": "call",
                     "side": "long",
@@ -1334,7 +1346,7 @@ async def main(page: ft.Page):
             
             strike_field = ft.TextField(
                 label="行使価格 K",
-                value=str(leg_data["strike"]),
+                value=f"{leg_data['strike']:.2f}" if state["spot_step"] < 1.0 else f"{leg_data['strike']:.0f}",
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
                 on_change=lambda e, idx=i: update_leg(
@@ -1344,7 +1356,7 @@ async def main(page: ft.Page):
             
             premium_field = ft.TextField(
                 label="プレミアム",
-                value=str(leg_data["premium"]),
+                value=f"{leg_data['premium']:.2f}",  # 小数点2桁で表示
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
                 on_change=lambda e, idx=i: update_leg(
@@ -1410,7 +1422,12 @@ async def main(page: ft.Page):
 
         spot_min = state["spot_center"] - state["spot_range"]
         spot_max = state["spot_center"] + state["spot_range"]
-        step = guess_strike_step_from_ticker(state["ticker"], state["spot_center"])
+        # 元のユーザー入力を使用して刻みを判定（XSPと^GSPCを区別するため）
+        ticker_for_step = state.get("ticker_input", state["ticker"])
+        step = guess_strike_step_from_ticker(ticker_for_step, state["spot_center"])
+        
+        # デバッグ出力
+        print(f"DEBUG build_strike_dials_ui: ticker_input={state.get('ticker_input')}, ticker={state.get('ticker')}, step={step}")
 
         for i in range(1, state["n_legs"] + 1):
             if i not in state["legs"]:
@@ -1420,10 +1437,12 @@ async def main(page: ft.Page):
             k = max(spot_min, min(k, spot_max))
 
             # on_change でこのレッグの strike を更新してグラフ再描画
-            def on_dial_change(e, idx=i):
+            # stepをデフォルト引数でキャプチャ
+            def on_dial_change(e, idx=i, strike_step=step):
                 val = safe_float(e.control.value, default=state["legs"][idx]["strike"])
                 # 刻みに丸め
-                new_k = round_to_step(val, step)
+                new_k = round_to_step(val, strike_step)
+                print(f"DEBUG on_dial_change: val={val}, strike_step={strike_step}, new_k={new_k}")
                 state["legs"][idx]["strike"] = new_k
                 # レッグ入力カード側も同期させたいなら再構築
                 build_legs_ui()
@@ -1535,7 +1554,9 @@ async def main(page: ft.Page):
 
             # 予想損益テキスト更新
             if what_if_pl_text is not None:
-                what_if_pl_text.value = format_currency(what_if_pl_value, state["ticker"])
+                # 元のユーザー入力を使用
+                ticker_for_currency = state.get("ticker_input", state["ticker"])
+                what_if_pl_text.value = format_currency(what_if_pl_value, ticker_for_currency)
         else:
             if what_if_pl_text is not None:
                 what_if_pl_text.value = ""
@@ -1576,7 +1597,12 @@ async def main(page: ft.Page):
                 ax.axvline(x=S_w, color='#2ca02c', linewidth=1.0, linestyle=':', alpha=0.8)
 
         ax.axhline(y=0, color='gray', linewidth=1)
-        ax.axvline(x=state["spot_center"], color='green', linewidth=1.2, linestyle=':', label=f'中心価格 ({state["spot_center"]:,.0f})')
+        # 中心価格の表示（0.5刻みなら小数点表示）
+        if state["spot_step"] < 1.0:
+            center_label = f'中心価格 ({state["spot_center"]:.1f})'
+        else:
+            center_label = f'中心価格 ({state["spot_center"]:,.0f})'
+        ax.axvline(x=state["spot_center"], color='green', linewidth=1.2, linestyle=':', label=center_label)
 
         # 各レッグの行使価格（K）にマーカー垂直線を引く
         # strikes = sorted(list({p.strike for p in positions}))
@@ -1596,8 +1622,11 @@ async def main(page: ft.Page):
             if not (spot_min <= k <= spot_max):
                 continue
 
-            # ラベル文字列 例: 63250C, 62000P
-            label = f"{int(k)}{'C' if pos.option_type == 'call' else 'P'}"
+            # ラベル文字列 例: 63250C, 62000P（0.5刻みなら 735.5C など）
+            if state["spot_step"] < 1.0:
+                label = f"{k:.1f}{'C' if pos.option_type == 'call' else 'P'}"
+            else:
+                label = f"{int(k)}{'C' if pos.option_type == 'call' else 'P'}"
 
             facecolor, edgecolor, textcolor = get_tag_style_for_position(pos)
 
@@ -1630,20 +1659,30 @@ async def main(page: ft.Page):
 
         # 横軸・縦軸のフォーマット改善（3桁カンマ区切り、詳細すぎる目盛りの整理）
         ax.set_xlim(spot_min, spot_max)
-        ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
+        
+        # X軸フォーマット：刻み幅が1未満なら小数点表示
+        if state["spot_step"] < 1.0:
+            ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.1f}"))
+        else:
+            ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
+        
         ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, p: f"{y:,.0f}"))
 
         # 目盛りの数を多すぎず（6〜8本程度に）キリの良い数値で自動調整
+        # 0.5刻みにも対応
         ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10]))
         ax.tick_params(axis='x', rotation=15, labelsize=9)
         ax.tick_params(axis='y', labelsize=9)
 
-        # 通貨記号を取得
-        currency = get_currency_symbol(state["ticker"])
+        # 通貨記号を取得（元のユーザー入力を使用）
+        ticker_for_currency = state.get("ticker_input", state["ticker"])
+        currency = get_currency_symbol(ticker_for_currency)
         
         ax.set_xlabel('原資産価格 S', fontsize=11)
         ax.set_ylabel(f'損益 ({currency})', fontsize=11)
-        ax.set_title(f'オプション戦略 損益グラフ（原資産: {state["ticker"]}）', fontsize=13, weight='bold')
+        # タイトルには元のユーザー入力を表示
+        ticker_for_title = state.get("ticker_input", state["ticker"])
+        ax.set_title(f'オプション戦略 損益グラフ（原資産: {ticker_for_title}）', fontsize=13, weight='bold')
         ax.legend(loc='best', framealpha=0.85)
         ax.grid(True, alpha=0.3, linestyle='--')
         fig.tight_layout()
@@ -1659,8 +1698,8 @@ async def main(page: ft.Page):
             ft.Image(src=img_bytes, width=800, height=440)
         )
 
-        # 通貨フォーマット用のティッカー取得
-        current_ticker = state["ticker"]
+        # 通貨フォーマット用のティッカー取得（元のユーザー入力を使用）
+        current_ticker = state.get("ticker_input", state["ticker"])
         
         base_text = (
             f"最大利益（期中）: {format_currency(max_now, current_ticker)}\n"

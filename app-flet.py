@@ -14,7 +14,7 @@ from typing import List, Literal
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
+import matplotlib.ticker as mticker
 import numpy as np
 from scipy.stats import norm
 import yfinance as yf
@@ -27,7 +27,8 @@ OptionType = Literal["call", "put"]
 SideType = Literal["long", "short"]
 
 XSP_SCALE = 0.1
-XSP_DEFAULT_STEP = 1.0   # 標準限月は$1刻み。ウィークリーのみ0.5可(刻み幅欄で変更)
+XSP_DEFAULT_STEP = 1.0   # XSPは通常・ウィークリーとも$1刻み
+US_STOCK_DEFAULT_STEP = 5.0   # 米国個別株は通常5.0。ウィークリーは刻み幅欄で2.5に変更
 
 
 def sanitize_numeric_text(val) -> str:
@@ -261,8 +262,7 @@ def guess_strike_step_from_ticker(ticker: str, price: float = None) -> float:
 
     # --- ETF・米個別株（SPY, QQQ, AAPL など） ---
     if not t.endswith(".T"):
-        # .T がついていないものを「海外銘柄」とみなして 1 ドル刻み
-        return 1.0
+        return stock_step_from_price(price)
 
     # --- 日本個別株 (.T) - オプションのストライク刻みは100円が標準 ---
     # ※現物株の呼値とオプションのストライク刻みは異なる
@@ -272,8 +272,20 @@ def guess_strike_step_from_ticker(ticker: str, price: float = None) -> float:
 def round_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
-    return round(x / step) * step
+    return round(round(x / step) * step, 4)
 
+
+def stock_step_from_price(price: float | None) -> float:
+    """米国株式・ETFのストライク刻みを株価から推定する(目安)。"""
+    if price is None or price <= 0:
+        return US_STOCK_DEFAULT_STEP
+    if price < 50:
+        return 0.5
+    if price < 200:
+        return 1.0
+    if price < 500:
+        return 2.5
+    return 5.0
 
 def bs_price(
     option_type: OptionType,
@@ -303,10 +315,33 @@ def bs_price(
 
 def is_xsp(raw) -> bool:
     # "XSP", "xsp", "^XSP", "$XSP" を同一視
-    return (raw or "").strip().upper().lstrip("^$") == "XSP"
+    if not isinstance(raw, str):
+        return False
+    return raw.strip().upper().lstrip("^$") == "XSP"
 
-def fmt_k(k: float) -> str:
-    return f"{k:.0f}" if float(k).is_integer() else f"{k:.2f}"
+
+def is_us_stock(raw) -> bool:
+    """米国個別株・ETF(AAPL, NVDA, SPY など)か。指数・日本株・XSPは除く。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    u = raw.strip().upper()
+    if u.startswith(("^", "$")) or u.endswith(".T") or u.isdigit():
+        return False
+    if u in ("SPX", "SPXW", "NDX", "RUT", "VIX", "INX", "SP500", "NASDAQ100",
+            "N225", "NI225", "NK225", "NKI", "TOPX", "TOPIX", "TPX", "XSP"):
+        return False
+    return True
+
+def uses_decimals(raw) -> bool:
+    """小数表示(価格2桁・行使価格1桁)にするティッカーか。"""
+    return is_xsp(raw) or is_us_stock(raw)
+
+
+def fmt_k(k: float, ticker: str = "") -> str:
+    """行使価格の表示用。XSPは小数点第1位、それ以外は整数(端数があれば小数点第1位)。"""
+    if is_xsp(ticker):
+        return f"{k:.1f}"
+    return f"{k:.0f}" if float(k).is_integer() else f"{k:.1f}"
 
 def theo_premium(opt, K, S, r, sigma, T_days) -> float:
     """BS理論価格をプレミアム初期値にする(価格水準に依存しない)"""
@@ -703,6 +738,12 @@ async def main(page: ft.Page):
         "what_if_iv": 0.20,   # 20%
     }
 
+    def fmt_spot(x: float) -> str:
+        """原資産価格の表示用。XSP・米国株式は小数点第2位、それ以外は整数。"""
+        if uses_decimals(state.get("ticker_input", "")):
+            return f"{x:,.2f}"
+        return f"{x:,.0f}"
+    
     # UI要素の参照
     ticker_field = ft.TextField(
         label="原資産ティッカー（例: ^N225, 7203.T）",
@@ -782,7 +823,7 @@ async def main(page: ft.Page):
     what_if_iv_value_text = ft.Text("", width=110)
 
     what_if_price_slider = ft.Slider(
-        min=0,
+        min=0.1,
         max=state["spot_center"] * 2,
         value=state["spot_center"],
         label="",           # ここは空でもOK（下でまとめて管理）
@@ -809,10 +850,12 @@ async def main(page: ft.Page):
 
 
     def update_what_if_value_labels():
-        # 価格はカンマ付き・0桁
         price = state.get("what_if_price", state.get("spot_center", 0.0))
-        what_if_price_slider.label = "{value}"
-        what_if_price_value_text.value = f"{price:,.0f}"
+        if uses_decimals(state.get("ticker_input", "")):
+            what_if_price_slider.label = "{value:.2f}"
+        else:
+            what_if_price_slider.label = "{value:.0f}"
+        what_if_price_value_text.value = fmt_spot(price)
 
         # 日数は「◯日」
         days = state.get("what_if_days", 0)
@@ -866,7 +909,10 @@ async def main(page: ft.Page):
         update_what_if_value_labels() 
 
     def update_what_if_label_texts():
-        what_if_price_slider.label = "{value}"
+        if uses_decimals(state.get("ticker_input", "")):
+            what_if_price_slider.label = "{value:.2f}"
+        else:
+            what_if_price_slider.label = "{value:.0f}"
         what_if_days_slider.label = "{value}日"
         what_if_iv_slider.label = "{value:.2f}"
 
@@ -1004,7 +1050,10 @@ async def main(page: ft.Page):
     def update_range_display():
         center = state["spot_center"]
         rng = state["spot_range"]
-        range_info_text.value = f"表示範囲: {center - rng:,.0f} 〜 {center + rng:,.0f}（中心: {center:,.0f} ±{rng:,.0f}）"
+        range_info_text.value = (
+            f"表示範囲: {fmt_spot(center - rng)} 〜 {fmt_spot(center + rng)}"
+            f"（中心: {fmt_spot(center)} ±{fmt_spot(rng)}）"
+        )
 
     def set_auto_range(e=None):
         update_state_from_fields()
@@ -1155,17 +1204,22 @@ async def main(page: ft.Page):
                     new_center = round(price, 2)
                     yfinance_info.value = (f"SPX 終値: 約 {raw_close:,.2f} → "
                                         f"XSP換算(1/10): 約 {price:,.2f}")
+                elif uses_decimals(raw):
+                    new_center = round(price, 2)
+                    yfinance_info.value = f"yfinance 終値: 約 {price:,.2f}"
                 else:
                     new_center = float(round(price, -1) if price > 1000 else round(price, 1))
                     yfinance_info.value = f"yfinance 終値: 約 {price:,.2f}"
                 state["spot_center"] = new_center
-                spot_center_field.value = str(new_center)
+                spot_center_field.value = f"{new_center:.2f}" if uses_decimals(raw) else str(new_center)
             else:
                 yfinance_info.value = "価格を取得できませんでした"
         else:
             state["spot_center"] = (manual_center if manual_center is not None
                                     else safe_float(spot_center_field.value, old_center))
         center = state["spot_center"]
+        # DEBUG: ティッカーと中心価格の情報を出力
+        print("DEBUG", repr(raw), is_us_stock(raw), uses_decimals(raw))
 
         # 2. 取引単位・刻み(ティッカー変更時のみ推定)
         if ticker_changed:
@@ -1327,7 +1381,7 @@ async def main(page: ft.Page):
             
             strike_field = ft.TextField(
                 label="行使価格 K",
-                value=fmt_k(leg_data["strike"]),
+                value=fmt_k(leg_data["strike"], state["ticker_input"]),
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
                 on_change=lambda e, idx=i: update_leg(
@@ -1424,12 +1478,12 @@ async def main(page: ft.Page):
                 min=lo, max=hi,
                 value=round_to_step(max(lo, min(k, hi)), step),
                 divisions=divisions,
-                label="{value}",
+                label="{value:.1f}",
                 on_change=on_dial_change,
                 on_change_end=on_dial_end,
                 expand=True,
             )
-            label_text = f"Leg {i}: {leg['type'][0].upper()}/{leg['side'][0].upper()}  K={fmt_k(k)}"
+            label_text = f"Leg {i}: {leg['type'][0].upper()}/{leg['side'][0].upper()}  K={fmt_k(k, state['ticker_input'])}"
             strike_dials_container.controls.append(
                 ft.Column([ft.Text(label_text, size=12), dial])
             )
@@ -1568,7 +1622,7 @@ async def main(page: ft.Page):
         ax.axhline(y=0, color='gray', linewidth=1)
         # 中心価格の表示（0.5刻みなら小数点表示）
         c = state["spot_center"]
-        center_label = f'中心価格 ({c:,.2f})' if c < 1000 else f'中心価格 ({c:,.0f})'
+        center_label = f'中心価格 ({fmt_spot(c)})'
         ax.axvline(x=state["spot_center"], color='green', linewidth=1.2, linestyle=':', label=center_label)
 
         # 各レッグの行使価格（K）にマーカー垂直線を引く
@@ -1590,7 +1644,7 @@ async def main(page: ft.Page):
                 continue
 
             # ラベル文字列 例: 63250C, 62000P（0.5刻みなら 735.5C など）
-            label = f"{fmt_k(k)}{'C' if pos.option_type == 'call' else 'P'}"
+            label = f"{fmt_k(k, state['ticker_input'])}{'C' if pos.option_type == 'call' else 'P'}"
 
             facecolor, edgecolor, textcolor = get_tag_style_for_position(pos)
 
@@ -1625,14 +1679,14 @@ async def main(page: ft.Page):
         ax.set_xlim(spot_min, spot_max)
         
         # X軸フォーマット：刻み幅が1未満なら小数点表示
-        ax.xaxis.set_major_formatter(ticker.FuncFormatter(
-            lambda x, p: f"{x:,.0f}" if float(x).is_integer() else f"{x:,.1f}"))
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+            lambda x, p: fmt_spot(x)))
         
-        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, p: f"{y:,.0f}"))
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, p: f"{y:,.0f}"))
 
         # 目盛りの数を多すぎず（6〜8本程度に）キリの良い数値で自動調整
         # 0.5刻みにも対応
-        ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10]))
+        ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10]))
         ax.tick_params(axis='x', rotation=15, labelsize=9)
         ax.tick_params(axis='y', labelsize=9)
 

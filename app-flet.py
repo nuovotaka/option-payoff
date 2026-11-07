@@ -26,6 +26,9 @@ import unicodedata
 OptionType = Literal["call", "put"]
 SideType = Literal["long", "short"]
 
+XSP_SCALE = 0.1
+XSP_DEFAULT_STEP = 1.0   # 標準限月は$1刻み。ウィークリーのみ0.5可(刻み幅欄で変更)
+
 
 def sanitize_numeric_text(val) -> str:
     normalized = unicodedata.normalize("NFKC", str(val or ""))
@@ -45,24 +48,29 @@ def safe_float(val, default=0.0) -> float:
         def_val = float(default) if default is not None else 0.0
     except (ValueError, TypeError):
         def_val = 0.0
+    if not math.isfinite(def_val):
+        def_val = 0.0
 
     if val is None:
         return def_val
     if isinstance(val, (int, float)):
-        return float(val)
+        result = float(val)
+        return result if math.isfinite(result) else def_val
     s = str(val).strip()
     if not s:
         return def_val
     s = sanitize_numeric_text(s)
     try:
-        return float(s)
+        result = float(s)
+        return result if math.isfinite(result) else def_val
     except (ValueError, TypeError):
         cleaned = s
         if cleaned.count(".") > 1:
             parts = cleaned.split(".")
             cleaned = parts[0] + "." + "".join(parts[1:])
         try:
-            return float(cleaned)
+            result = float(cleaned)
+            return result if math.isfinite(result) else def_val
         except (ValueError, TypeError):
             return def_val
 
@@ -91,6 +99,10 @@ def normalize_ticker_for_yfinance(raw: str) -> str:
     s = raw.strip()
     u = s.upper()
 
+    # XSPはyfinanceに無い → SPXを取得し、別途1/10する
+    if is_xsp(s):
+        return "^GSPC"
+
     # すでに ^ や .T などが付いていれば、そのまま使う
     if u.startswith("^"):
         return s
@@ -105,14 +117,10 @@ def normalize_ticker_for_yfinance(raw: str) -> str:
     if u in ("TOPX", "TOPIX", "TPX"):
         return "^TOPX"  # 必要に応じて他のコードに変更
 
-    # --- ここから米インデックス関連 ---
+    # --- 米インデックス関連 ---
     # S&P500 index (SPX), S&P500 index mini (XSP)
     # XSPはSPXの1/10スケールなので、同じ^GSPCを参照
     if u in ("SPX", "SPX INDEX", "INX", "SP500"):
-        return "^GSPC"
-    
-    # XSP (Mini-SPX) - SPXと同じ指数を参照するが、別ティッカーとして認識
-    if u == "XSP":
         return "^GSPC"
 
     # NASDAQ100
@@ -194,7 +202,17 @@ def get_last_close(ticker: str) -> float | None:
         return None
 
 
+def get_underlying_price(raw: str):
+    """(換算後価格, 換算前の終値) を返す。XSPは SPX/10"""
+    last = get_last_close(normalize_ticker_for_yfinance(raw))
+    if last is None:
+        return None, None
+    return (last * XSP_SCALE if is_xsp(raw) else last), last
+
+
 def guess_contract_size_from_ticker(ticker: str) -> int:
+    if is_xsp(ticker):          # 乗数$100(SPXと同じ)
+        return 100
     # 正規化してから判定
     norm = normalize_ticker_for_yfinance(ticker)
     t = norm.upper()
@@ -205,10 +223,6 @@ def guess_contract_size_from_ticker(ticker: str) -> int:
         if "MINI" in t:
             return 100
         return 1000
-
-    # XSP (Mini-SPX) は100（SPXの1/10スケール）
-    if "XSP" in ticker.upper():  # 元の入力をチェック（正規化前）
-        return 100
     
     # SPX / NDX / RUT など米インデックス
     if any(x in t for x in ("SPX", "^GSPC", "^NDX", "NDX", "^RUT", "RUT")):
@@ -222,6 +236,8 @@ def guess_contract_size_from_ticker(ticker: str) -> int:
 
 
 def guess_strike_step_from_ticker(ticker: str, price: float = None) -> float:
+    if is_xsp(ticker):
+        return XSP_DEFAULT_STEP
     # 正規化してから判定（ただしXSPは元の入力もチェック）
     norm = normalize_ticker_for_yfinance(ticker)
     t = norm.upper()
@@ -234,10 +250,7 @@ def guess_strike_step_from_ticker(ticker: str, price: float = None) -> float:
         return 125.0
 
     # --- 米国指数（SPX/XSP/NDX/RUT など） ---
-    # XSP (Mini-SPX) - 0.5刻み（元の入力をチェック）
-    if "XSP" in orig_t:
-        return 0.5
-    
+
     # SPX / ^GSPC
     if any(x in t for x in ("SPX", "^GSPC")):
         return 5.0  # SPXは通常5ドル刻み
@@ -260,12 +273,6 @@ def round_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return round(x / step) * step
-
-
-def round_to_step_ceiling(x: float, step: float) -> float:
-    if step <= 0:
-        return x
-    return math.ceil(x / step) * step
 
 
 def bs_price(
@@ -294,6 +301,19 @@ def bs_price(
         return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 
+def is_xsp(raw) -> bool:
+    # "XSP", "xsp", "^XSP", "$XSP" を同一視
+    return (raw or "").strip().upper().lstrip("^$") == "XSP"
+
+def fmt_k(k: float) -> str:
+    return f"{k:.0f}" if float(k).is_integer() else f"{k:.2f}"
+
+def theo_premium(opt, K, S, r, sigma, T_days) -> float:
+    """BS理論価格をプレミアム初期値にする(価格水準に依存しない)"""
+    v = float(bs_price(opt, np.array([S], dtype=float), K, r, sigma, T_days / 365.0)[0])
+    return round(v, 2 if S < 1000 else 1)
+
+
 @dataclass
 class OptionPosition:
     option_type: OptionType
@@ -306,22 +326,6 @@ class OptionPosition:
     sigma: float = 0.2
     T: float = 0.1
 
-    def get_tag_style_for_position(pos: OptionPosition):
-        if pos.option_type == "call":
-            base_color = "#22c55e"  # 緑
-        else:
-            base_color = "#ef4444"  # 赤
-
-        if pos.side == "short":
-            facecolor = base_color
-            edgecolor = "white"
-            textcolor = "white"
-        else:
-            facecolor = "none"
-            edgecolor = base_color
-            textcolor = base_color
-
-        return facecolor, edgecolor, textcolor
 
     def payoff_at_maturity(self, S: np.ndarray) -> np.ndarray:
         if self.option_type == "call":
@@ -443,6 +447,7 @@ def build_positions_from_preset(
     contract_size: int,
     r: float,
     ticker: str,
+    step: float | None = None,
 ) -> List[OptionPosition]:
     preset = resolve_strategy_preset(preset)
     positions: List[OptionPosition] = []
@@ -451,8 +456,8 @@ def build_positions_from_preset(
     T_short = 30 / 365
     T_long = 90 / 365
 
-    step = guess_strike_step_from_ticker(ticker, spot_center)
-    k_atm = round_to_step_ceiling(spot_center, step)
+    step = step or guess_strike_step_from_ticker(ticker, spot_center)
+    k_atm = round_to_step(spot_center, step)
     k_down1 = k_atm - step
     k_up1 = k_atm + step
     k_low = round_to_step(spot_center * 0.95, step)
@@ -657,6 +662,9 @@ def build_positions_from_preset(
         positions.append(
             OptionPosition("call", "long", k_very_high, p_xsml, 1, contract_size, r, sigma, T_short)
         )
+
+    for p in positions:
+        p.premium = theo_premium(p.option_type, p.strike, spot_center, r, p.sigma, p.T * 365)
 
     return positions
 
@@ -1010,7 +1018,7 @@ async def main(page: ft.Page):
         center = state["spot_center"]
         # 元のユーザー入力を使用
         ticker_for_step = state.get("ticker_input", state["ticker"])
-        strike_step = guess_strike_step_from_ticker(ticker_for_step)
+        strike_step = state["spot_step"]
         if strikes:
             max_dist = max([abs(k - center) for k in strikes] + [strike_step * 2])
             auto_range = float(round_to_step(max_dist * 1.5, strike_step))
@@ -1022,6 +1030,7 @@ async def main(page: ft.Page):
         spot_range_field.value = str(auto_range)
         update_range_slider_bounds(auto_range)
         update_range_display()
+        build_strike_dials_ui()
         generate_chart()
 
     def set_quick_range(val: float):
@@ -1030,6 +1039,7 @@ async def main(page: ft.Page):
         spot_range_field.value = str(val)
         update_range_slider_bounds(val)
         update_range_display()
+        build_strike_dials_ui()
         generate_chart()
 
     def set_quick_range_percent(pct: float):
@@ -1037,7 +1047,7 @@ async def main(page: ft.Page):
         center = state["spot_center"]
         # 元のユーザー入力を使用
         ticker_for_step = state.get("ticker_input", state["ticker"])
-        strike_step = guess_strike_step_from_ticker(ticker_for_step)
+        strike_step = state["spot_step"]
         val = float(round_to_step(center * (pct / 100.0), strike_step))
         val = max(val, strike_step * 2)
         set_quick_range(val)
@@ -1047,6 +1057,7 @@ async def main(page: ft.Page):
         state["spot_range"] = val
         spot_range_field.value = str(val)
         update_range_display()
+        build_strike_dials_ui()
         generate_chart()
 
     range_slider.on_change = on_range_slider_change
@@ -1082,6 +1093,11 @@ async def main(page: ft.Page):
     )
 
     def update_state_from_fields():
+
+        v = safe_float(spot_step_field.value, 0.0)
+        if v > 0:
+            state["spot_step"] = v
+
         # ティッカーは正規化して保存（update_ticker_info と同じロジック）
         raw = ticker_field.value or "^N225"
         state["ticker_input"] = raw
@@ -1098,7 +1114,9 @@ async def main(page: ft.Page):
         except (ValueError, TypeError):
             pass
         try:
-            state["spot_step"] = float(spot_step_field.value)
+            v = safe_float(spot_step_field.value, 0.0)
+            if v > 0:
+                state["spot_step"] = v
         except (ValueError, TypeError):
             pass
         try:
@@ -1110,132 +1128,101 @@ async def main(page: ft.Page):
         except (ValueError, TypeError):
             pass
 
-    def update_ticker_info(e=None, force_k_update=True):
-        # ユーザー入力そのまま
-        raw = ticker_field.value or "^N225"
-        state["ticker_input"] = raw
-        u_raw = raw.strip().upper()
 
-        # yfinance 用に正規化
+    def make_default_leg(center, step):
+        k = round_to_step(center, step)
+        return {"type": "call", "side": "long", "strike": k,
+                "premium": theo_premium("call", k, center, state["r"], 0.2, 30),
+                "quantity": 1, "sigma": 0.2, "T_days": 30}
+
+
+    def update_ticker_info(e=None, force_k_update=True, manual_center=None):
+        raw = ticker_field.value or "^N225"
+        ticker_changed = (raw != state.get("prev_ticker"))
+        state["prev_ticker"] = raw
+        state["ticker_input"] = raw
         norm = normalize_ticker_for_yfinance(raw)
         state["ticker_yf"] = norm
         state["ticker"] = norm
 
         old_center = state.get("spot_center", 32000.0)
 
-        # 1. yfinance から中心価格を取得
-        if auto_fetch_check.value:
-            last_close = get_last_close(state["ticker_yf"])
-            if last_close is not None:
-                # ★ XSP のときだけ 1/10 に換算して使う
-                if u_raw == "XSP":
-                    last_close_xsp = last_close / 10.0
-                    new_center = float(round(last_close_xsp, 1))
-                    yfinance_info.value = (
-                        f"SPX 終値: 約 {last_close:,.2f} → "
-                        f"XSP換算: 約 {last_close_xsp:,.2f}"
-                    )
+        # 1. 中心価格
+        if manual_center is None and auto_fetch_check.value:
+            price, raw_close = get_underlying_price(raw)
+            if price is not None:
+                if is_xsp(raw):
+                    new_center = round(price, 2)
+                    yfinance_info.value = (f"SPX 終値: 約 {raw_close:,.2f} → "
+                                        f"XSP換算(1/10): 約 {price:,.2f}")
                 else:
-                    last_close_xsp = None  # 使わないが一応
-                    new_center = float(
-                        round(last_close, -1) if last_close > 1000 else round(last_close, 1)
-                    )
-                    yfinance_info.value = f"yfinance 終値: 約 {last_close:,.2f}"
-
+                    new_center = float(round(price, -1) if price > 1000 else round(price, 1))
+                    yfinance_info.value = f"yfinance 終値: 約 {price:,.2f}"
                 state["spot_center"] = new_center
-                spot_center_field.value = str(state["spot_center"])
+                spot_center_field.value = str(new_center)
             else:
                 yfinance_info.value = "価格を取得できませんでした"
         else:
-            try:
-                state["spot_center"] = float(spot_center_field.value)
-            except (ValueError, TypeError):
-                pass
-
+            state["spot_center"] = (manual_center if manual_center is not None
+                                    else safe_float(spot_center_field.value, old_center))
         center = state["spot_center"]
 
-        # 2. 取引単位 & 刻み幅の推定
-        #    （XSP と ^GSPC を区別するため）
-        state["contract_size"] = guess_contract_size_from_ticker(state["ticker_input"])
-        contract_size_field.value = str(state["contract_size"])
+        # 2. 取引単位・刻み(ティッカー変更時のみ推定)
+        if ticker_changed:
+            state["contract_size"] = guess_contract_size_from_ticker(raw)
+            contract_size_field.value = str(state["contract_size"])
+            state["spot_step"] = guess_strike_step_from_ticker(raw, center)
+            spot_step_field.value = str(state["spot_step"])
+        strike_step = state["spot_step"]
 
-        strike_step = guess_strike_step_from_ticker(state["ticker_input"], state["spot_center"])
-        state["spot_step"] = strike_step
-        spot_step_field.value = str(strike_step)
-
-        # 3. レンジ幅の適正化（価格水準が大幅に変化した場合や、マイナスになる場合に自動調整）
-        suggested_range = float(round_to_step(center * 0.15, strike_step))
-        suggested_range = max(suggested_range, strike_step * 5)
-        if state["spot_range"] >= center or abs(center - old_center) > (old_center * 0.1):
+        # 3. レンジ幅(既存どおり、strike_step を使う)
+        suggested_range = max(float(round_to_step(center * 0.15, strike_step)), strike_step * 5)
+        if state["spot_range"] >= center or abs(center - old_center) > old_center * 0.1:
             state["spot_range"] = suggested_range
             spot_range_field.value = str(suggested_range)
             update_range_slider_bounds(suggested_range)
         else:
             update_range_slider_bounds(state["spot_range"])
 
-        # 4. 行使価格 K の自動変更
+        # 4. レッグ再構築
         if force_k_update:
             if state.get("preset", StrategyPreset.NONE) != StrategyPreset.NONE:
-                # 戦略プリセットが選択されている場合: 新しい原資産価格で戦略の全レッグを再構築
                 preset_positions = build_positions_from_preset(
                     preset=state["preset"],
                     spot_center=center,
                     contract_size=state["contract_size"],
                     r=state["r"],
-                    ticker=state["ticker"],
+                    ticker=state["ticker_input"],
+                    step=state["spot_step"],
                 )
                 state["n_legs"] = len(preset_positions)
                 legs_slider.value = state["n_legs"]
-                state["legs"] = {}
-                for i, pos in enumerate(preset_positions, start=1):
-                    state["legs"][i] = {
-                        "type": pos.option_type,
-                        "side": pos.side,
-                        "strike": pos.strike,
-                        "premium": pos.premium,
-                        "quantity": pos.quantity,
-                        "sigma": pos.sigma,
-                        "T_days": int(pos.T * 365)
-                    }
+                state["legs"] = {
+                    i: {"type": p.option_type, "side": p.side, "strike": p.strike,
+                        "premium": p.premium, "quantity": p.quantity,
+                        "sigma": p.sigma, "T_days": int(round(p.T * 365))}
+                    for i, p in enumerate(preset_positions, start=1)}
             else:
-                # 手動設定の場合: 新しい原資産価格に合わせて各行使価格をシフト
                 ratio = center / old_center if old_center > 0 else 1.0
-                atm_strike = round_to_step(center, strike_step)
+                rescale = abs(ratio - 1.0) > 0.03
                 for i in range(1, state["n_legs"] + 1):
-                    if i in state["legs"]:
-                        old_k = state["legs"][i].get("strike", old_center)
-                        if old_center > 0 and abs(ratio - 1.0) > 0.03:
-                            # 3%以上の価格変化があれば比率でシフトして刻みに丸める
-                            state["legs"][i]["strike"] = round_to_step(old_k * ratio, strike_step)
-                        elif "strike" not in state["legs"][i]:
-                            state["legs"][i]["strike"] = atm_strike
-                    else:
-                        state["legs"][i] = {
-                            "type": "call",
-                            "side": "long",
-                            "strike": atm_strike,
-                            "premium": 300.0 if center > 10000 else float(round_to_step(center * 0.02, 1.0)),
-                            "quantity": 1,
-                            "sigma": 0.2,
-                            "T_days": 30
-                        }
+                    leg = state["legs"].get(i)
+                    if leg is None:
+                        state["legs"][i] = make_default_leg(center, strike_step)
+                        continue
+                    if rescale:
+                        leg["strike"] = round_to_step(leg.get("strike", old_center) * ratio, strike_step)
+                        leg["premium"] = theo_premium(leg["type"], leg["strike"], center,
+                                                    state["r"], leg["sigma"], leg["T_days"])
+                    elif "strike" not in leg:
+                        leg["strike"] = round_to_step(center, strike_step)
 
-        # 5. UI再構築 & レンジ表示更新 & グラフ再描画
+        # 5. 再構築・再描画(既存どおり)
         build_legs_ui()
         update_range_display()
-
-        # What-if スライダー範囲も更新
-        if "what_if_price" in state:
-            what_if_price_slider.min = spot_min = state["spot_center"] - state["spot_range"]
-            what_if_price_slider.max = spot_max = state["spot_center"] + state["spot_range"]
-            # 中心近辺に初期化
-            state["what_if_price"] = state["spot_center"]
-            what_if_price_slider.value = state["spot_center"]
-
-        # what-if を現在のレッグから再初期化
         reset_what_if_from_legs()
-
         generate_chart()
+
 
     def on_preset_change(e=None):
         val = None
@@ -1257,7 +1244,8 @@ async def main(page: ft.Page):
                 spot_center=state["spot_center"],
                 contract_size=state["contract_size"],
                 r=state["r"],
-                ticker=state["ticker"],
+                ticker=state["ticker_input"],
+                step=state["spot_step"],
             )
             state["n_legs"] = len(preset_positions)
             legs_slider.value = state["n_legs"]
@@ -1272,7 +1260,7 @@ async def main(page: ft.Page):
                     "premium": pos.premium,
                     "quantity": pos.quantity,
                     "sigma": pos.sigma,
-                    "T_days": int(pos.T * 365)
+                    "T_days": int(round(pos.T * 365))
                 }
             
             # UIを再構築して全体が収まる自動レンジで再描画
@@ -1301,18 +1289,7 @@ async def main(page: ft.Page):
         
         for i in range(1, state["n_legs"] + 1):
             if i not in state["legs"]:
-                # 元のユーザー入力を使用
-                ticker_for_step = state.get("ticker_input", state["ticker"])
-                strike_step = guess_strike_step_from_ticker(ticker_for_step, state["spot_center"])
-                state["legs"][i] = {
-                    "type": "call",
-                    "side": "long",
-                    "strike": round_to_step_ceiling(state["spot_center"], strike_step),
-                    "premium": 300.0,
-                    "quantity": 1,
-                    "sigma": 0.2,
-                    "T_days": 30
-                }
+                state["legs"][i] = make_default_leg(state["spot_center"], state["spot_step"])
             
             leg_data = state["legs"][i]
             
@@ -1344,14 +1321,20 @@ async def main(page: ft.Page):
                 if hasattr(side_dropdown, ev):
                     setattr(side_dropdown, ev, side_handler)
             
+            def sync_dials(e):
+                build_strike_dials_ui()
+                generate_chart()
+            
             strike_field = ft.TextField(
                 label="行使価格 K",
-                value=f"{leg_data['strike']:.2f}" if state["spot_step"] < 1.0 else f"{leg_data['strike']:.0f}",
+                value=fmt_k(leg_data["strike"]),
                 keyboard_type=ft.KeyboardType.NUMBER,
                 width=150,
                 on_change=lambda e, idx=i: update_leg(
                     idx, "strike", safe_float(sanitize_numeric_input(e), default=state["legs"].get(idx, {}).get("strike", 0.0))
-                )
+                ),
+                on_blur=sync_dials,
+                on_submit=sync_dials,
             )
             
             premium_field = ft.TextField(
@@ -1412,68 +1395,54 @@ async def main(page: ft.Page):
 
 
     def build_strike_dials_ui():
-        """
-        グラフ上部に、各レッグのストライクを操作する横スライダーを並べる。
-        """
         strike_dials_container.controls.clear()
-
         if not state["legs"]:
             return
-
-        spot_min = state["spot_center"] - state["spot_range"]
-        spot_max = state["spot_center"] + state["spot_range"]
-        # 元のユーザー入力を使用して刻みを判定（XSPと^GSPCを区別するため）
-        ticker_for_step = state.get("ticker_input", state["ticker"])
-        step = guess_strike_step_from_ticker(ticker_for_step, state["spot_center"])
-        
-        # デバッグ出力
-        print(f"DEBUG build_strike_dials_ui: ticker_input={state.get('ticker_input')}, ticker={state.get('ticker')}, step={step}")
+        step = state["spot_step"]
+        lo = math.ceil((state["spot_center"] - state["spot_range"]) / step - 1e-9) * step
+        hi = math.floor((state["spot_center"] + state["spot_range"]) / step + 1e-9) * step
+        if hi <= lo:
+            hi = lo + step
+        divisions = max(1, round((hi - lo) / step))
 
         for i in range(1, state["n_legs"] + 1):
-            if i not in state["legs"]:
+            leg = state["legs"].get(i)
+            if not leg:
                 continue
-            leg = state["legs"][i]
-            k = float(leg.get("strike", state["spot_center"]))
-            k = max(spot_min, min(k, spot_max))
+            k = float(leg["strike"])
 
-            # on_change でこのレッグの strike を更新してグラフ再描画
-            # stepをデフォルト引数でキャプチャ
-            def on_dial_change(e, idx=i, strike_step=step):
-                val = safe_float(e.control.value, default=state["legs"][idx]["strike"])
-                # 刻みに丸め
-                new_k = round_to_step(val, strike_step)
-                print(f"DEBUG on_dial_change: val={val}, strike_step={strike_step}, new_k={new_k}")
-                state["legs"][idx]["strike"] = new_k
-                # レッグ入力カード側も同期させたいなら再構築
-                build_legs_ui()
+            def on_dial_change(e, idx=i, st=step):
+                new_k = round_to_step(safe_float(e.control.value, state["legs"][idx]["strike"]), st)
+                state["legs"][idx]["strike"] = round(new_k, 4)
                 generate_chart()
 
+            def on_dial_end(e):
+                build_legs_ui()
+                page.update()
+
             dial = ft.Slider(
-                min=spot_min,
-                max=spot_max,
-                value=k,
+                min=lo, max=hi,
+                value=round_to_step(max(lo, min(k, hi)), step),
+                divisions=divisions,
                 label="{value}",
-                divisions=int(max(1, (spot_max - spot_min) / step)),
                 on_change=on_dial_change,
+                on_change_end=on_dial_end,
                 expand=True,
             )
-
-            # ラベルは「レッグ番号 + C/P + Long/Short + 現在ストライク」
-            label_text = f"Leg {i}: {leg['type'][0].upper()}/{leg['side'][0].upper()}  K={k:,.0f}"
-
+            label_text = f"Leg {i}: {leg['type'][0].upper()}/{leg['side'][0].upper()}  K={fmt_k(k)}"
             strike_dials_container.controls.append(
-                ft.Column(
-                    [
-                        ft.Text(label_text, size=12),
-                        dial,
-                    ]
-                )
+                ft.Column([ft.Text(label_text, size=12), dial])
             )
 
-
     def update_leg(leg_idx, field, value):
-        if leg_idx in state["legs"]:
-            state["legs"][leg_idx][field] = value
+        if leg_idx not in state["legs"]:
+            return
+        state["legs"][leg_idx][field] = value
+
+        # 種類・売買が変わったらダイヤルのラベルを作り直し、グラフも更新する
+        if field in ("type", "side"):
+            build_strike_dials_ui()
+            generate_chart()      # 内部で page.update() まで行う
 
     def generate_chart(e=None):
         update_state_from_fields()
@@ -1598,10 +1567,8 @@ async def main(page: ft.Page):
 
         ax.axhline(y=0, color='gray', linewidth=1)
         # 中心価格の表示（0.5刻みなら小数点表示）
-        if state["spot_step"] < 1.0:
-            center_label = f'中心価格 ({state["spot_center"]:.1f})'
-        else:
-            center_label = f'中心価格 ({state["spot_center"]:,.0f})'
+        c = state["spot_center"]
+        center_label = f'中心価格 ({c:,.2f})' if c < 1000 else f'中心価格 ({c:,.0f})'
         ax.axvline(x=state["spot_center"], color='green', linewidth=1.2, linestyle=':', label=center_label)
 
         # 各レッグの行使価格（K）にマーカー垂直線を引く
@@ -1623,10 +1590,7 @@ async def main(page: ft.Page):
                 continue
 
             # ラベル文字列 例: 63250C, 62000P（0.5刻みなら 735.5C など）
-            if state["spot_step"] < 1.0:
-                label = f"{k:.1f}{'C' if pos.option_type == 'call' else 'P'}"
-            else:
-                label = f"{int(k)}{'C' if pos.option_type == 'call' else 'P'}"
+            label = f"{fmt_k(k)}{'C' if pos.option_type == 'call' else 'P'}"
 
             facecolor, edgecolor, textcolor = get_tag_style_for_position(pos)
 
@@ -1661,10 +1625,8 @@ async def main(page: ft.Page):
         ax.set_xlim(spot_min, spot_max)
         
         # X軸フォーマット：刻み幅が1未満なら小数点表示
-        if state["spot_step"] < 1.0:
-            ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.1f}"))
-        else:
-            ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
+        ax.xaxis.set_major_formatter(ticker.FuncFormatter(
+            lambda x, p: f"{x:,.0f}" if float(x).is_integer() else f"{x:,.1f}"))
         
         ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, p: f"{y:,.0f}"))
 
@@ -1730,18 +1692,37 @@ async def main(page: ft.Page):
                 state["spot_range"] = val
                 update_range_slider_bounds(val)
                 update_range_display()
+                build_strike_dials_ui()
         except (ValueError, TypeError):
             pass
 
+
+    def on_ticker_commit(e):
+        # ティッカーが変わったときだけ再取得(blur のたびにレッグが初期化されるのを防ぐ)
+        if (ticker_field.value or "") != state.get("prev_ticker"):
+            update_ticker_info(force_k_update=True)
+
+    ticker_field.on_submit = on_ticker_commit
+    ticker_field.on_blur = on_ticker_commit
+
     def on_spot_center_field_change(e):
         sanitize_numeric_input(e)
-        try:
-            val = float(spot_center_field.value)
-            if val > 0 and abs(val - state["spot_center"]) > 0.01:
-                state["spot_center"] = val
-                update_ticker_info(force_k_update=True)
-        except (ValueError, TypeError):
-            pass
+        val = safe_float(spot_center_field.value, 0.0)
+        if val > 0 and abs(val - state["spot_center"]) > 0.01:
+            auto_fetch_check.value = False                 # 手入力を優先
+            update_ticker_info(force_k_update=True, manual_center=val)
+            # ※ state["spot_center"] を先に書き換えない(old_center が潰れるため)
+
+    def on_step_change(e):
+        sanitize_numeric_input(e)
+        v = safe_float(spot_step_field.value, 0.0)
+        if v > 0:
+            state["spot_step"] = v
+            build_strike_dials_ui()
+            page.update()
+
+    spot_step_field.on_change = on_step_change
+
 
     # イベントハンドラー設定
     ticker_field.on_submit = lambda e: update_ticker_info(force_k_update=True)
@@ -1817,7 +1798,6 @@ async def main(page: ft.Page):
     
     # 初期情報更新 & 初回グラフ描画
     update_ticker_info()
-    generate_chart()
 
 
 if __name__ == "__main__":

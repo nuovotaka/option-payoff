@@ -1218,8 +1218,6 @@ async def main(page: ft.Page):
             state["spot_center"] = (manual_center if manual_center is not None
                                     else safe_float(spot_center_field.value, old_center))
         center = state["spot_center"]
-        # DEBUG: ティッカーと中心価格の情報を出力
-        print("DEBUG", repr(raw), is_us_stock(raw), uses_decimals(raw))
 
         # 2. 取引単位・刻み(ティッカー変更時のみ推定)
         if ticker_changed:
